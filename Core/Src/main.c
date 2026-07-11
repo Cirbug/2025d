@@ -38,28 +38,28 @@
 /* USER CODE BEGIN PTD */
 typedef struct
 {
-  uint8_t armed;
-  uint32_t last_cross_tick;
-  uint32_t frequency_hz;
+  uint8_t armed;              /* 已经低于下阈值后才允许检测下一次上升沿，防止同一个波形被重复计数 */
+  uint32_t last_cross_tick;   /* 上一次 ADC 波形越过高阈值的系统 tick，单位 ms */
+  uint32_t frequency_hz;      /* 根据两次越过阈值的时间差估算出的频率 */
 } AdcFreqMeter;
 
 /* USER CODE END PTD */
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define VOFA_SEND_PERIOD_MS 2U
-#define LCD_REFRESH_PERIOD_MS 100U
-#define LCD_WAVE_POINTS 304U
+#define VOFA_SEND_PERIOD_MS 2U          /* VOFA 串口发送周期，2ms 约等于 500Hz 刷新 */
+#define LCD_REFRESH_PERIOD_MS 100U      /* LCD 刷新比较慢，100ms 刷一次可减少闪烁和占用 */
+#define LCD_WAVE_POINTS 304U            /* 波形横向采样点数，基本铺满 320 像素屏宽 */
 #define LCD_WAVE_LEFT 8U
 #define LCD_WAVE_WIDTH LCD_WAVE_POINTS
-#define LCD_ADC1_TOP 80U
-#define LCD_ADC2_TOP 168U
-#define LCD_WAVE_HEIGHT 56U
-#define ADC_MAX_CODE 4095U
-#define TIM5_COUNTER_HZ 1000000U
-#define FREQ_TIMEOUT_MS 1000U
-#define ADC_FREQ_LOW_THRESHOLD 1900U
-#define ADC_FREQ_HIGH_THRESHOLD 2200U
+#define LCD_ADC1_TOP 80U                /* ADC1 波形区域顶部坐标 */
+#define LCD_ADC2_TOP 168U               /* ADC2 波形区域顶部坐标 */
+#define LCD_WAVE_HEIGHT 56U             /* 单条波形区域高度 */
+#define ADC_MAX_CODE 4095U              /* 12 位 ADC 最大值 */
+#define TIM5_COUNTER_HZ 1000000U        /* TIM5 计数频率：84MHz / 84 = 1MHz，1 个计数 = 1us */
+#define FREQ_TIMEOUT_MS 1000U           /* 超过 1 秒没有新边沿/过阈值，就认为频率为 0 */
+#define ADC_FREQ_LOW_THRESHOLD 1900U    /* ADC 软件测频低阈值，用来重新“武装”检测 */
+#define ADC_FREQ_HIGH_THRESHOLD 2200U   /* ADC 软件测频高阈值，超过它认为出现一次上升穿越 */
 
 /* USER CODE END PD */
 
@@ -71,18 +71,18 @@ typedef struct
 /* Private variables ---------------------------------------------------------*/
 
 /* USER CODE BEGIN PV */
-static uint16_t adc1_value = 0U;
-static uint16_t adc2_value = 0U;
-static uint16_t lcd_adc1_wave[LCD_WAVE_POINTS];
-static uint16_t lcd_adc2_wave[LCD_WAVE_POINTS];
-static uint16_t lcd_wave_index = 0U;
-static uint16_t lcd_wave_count = 0U;
-static volatile uint32_t frequency_hz = 0U;
-static volatile uint32_t frequency_last_capture_tick = 0U;
-static uint32_t tim5_last_capture = 0U;
-static uint8_t tim5_capture_ready = 0U;
-static AdcFreqMeter adc1_freq_meter = {1U, 0U, 0U};
-static AdcFreqMeter adc2_freq_meter = {1U, 0U, 0U};
+static uint16_t adc1_value = 0U;                         /* ADC1 当前采样值，PA2 */
+static uint16_t adc2_value = 0U;                         /* ADC2 当前采样值，PA3 */
+static uint16_t lcd_adc1_wave[LCD_WAVE_POINTS];          /* LCD 上 ADC1 波形的环形缓冲区 */
+static uint16_t lcd_adc2_wave[LCD_WAVE_POINTS];          /* LCD 上 ADC2 波形的环形缓冲区 */
+static uint16_t lcd_wave_index = 0U;                     /* 下一次写入波形缓冲区的位置 */
+static uint16_t lcd_wave_count = 0U;                     /* 当前已经累计的有效波形点数 */
+static volatile uint32_t frequency_hz = 0U;              /* PA0/TIM5 输入捕获测得的频率 */
+static volatile uint32_t frequency_last_capture_tick = 0U; /* PA0 最近一次捕获到边沿的 tick */
+static uint32_t tim5_last_capture = 0U;                  /* TIM5 上一次捕获寄存器值 */
+static uint8_t tim5_capture_ready = 0U;                  /* 第一次捕获只记录基准，第二次开始才可计算周期 */
+static AdcFreqMeter adc1_freq_meter = {1U, 0U, 0U};      /* ADC1 软件测频状态 */
+static AdcFreqMeter adc2_freq_meter = {1U, 0U, 0U};      /* ADC2 软件测频状态 */
 
 /* USER CODE END PV */
 
@@ -223,6 +223,7 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 void App_Init(void)
 {
+  /* FreeRTOS 任务启动后先初始化 LCD、DAC，再打开 PA0 的 TIM5 输入捕获中断 */
   LcdDisplay_Init();
   AdcDacVofa_Start();
 
@@ -238,23 +239,31 @@ void App_TaskStep(void)
   uint32_t now = HAL_GetTick();
   uint32_t pa0_freq = frequency_hz;
 
+  /* PA0 如果 1 秒没有捕获到新边沿，说明输入信号停止或频率太低，显示为 0Hz */
   if ((now - frequency_last_capture_tick) > FREQ_TIMEOUT_MS)
   {
     pa0_freq = 0U;
     frequency_hz = 0U;
   }
 
+  /* 读取两个 ADC：ADC1 对应 PA2，ADC2 对应 PA3 */
   adc1_value = ReadAdcValue(&hadc1, adc1_value);
   adc2_value = ReadAdcValue(&hadc2, adc2_value);
+
+  /* 用 ADC 采样值做软件测频。这个方法适合低频，采样间隔越稳定越准 */
   uint32_t adc1_freq = AdcFreq_Update(&adc1_freq_meter, adc1_value, now);
   uint32_t adc2_freq = AdcFreq_Update(&adc2_freq_meter, adc2_value, now);
 
+  /* DAC 输出跟随 ADC：ADC1 -> DAC1(PA4)，ADC2 -> DAC2(PA5) */
   UpdateDacOutputs(adc1_value, adc2_value);
+
+  /* LCD 不需要每 1ms 都刷，函数内部会按 LCD_REFRESH_PERIOD_MS 限速 */
   LcdDisplay_Update(now, adc1_value, adc2_value, pa0_freq, adc1_freq, adc2_freq);
 
   if ((now - last_vofa_tick) >= VOFA_SEND_PERIOD_MS)
   {
     last_vofa_tick = now;
+    /* 波形点和 VOFA 数据都按 VOFA_SEND_PERIOD_MS 推进 */
     LcdPushSamples(adc1_value, adc2_value);
     Vofa_SendSamples(adc1_value, adc2_value, pa0_freq, adc1_freq, adc2_freq);
   }
@@ -262,6 +271,7 @@ void App_TaskStep(void)
 
 static void AdcDacVofa_Start(void)
 {
+  /* DAC 必须先启动，后面 HAL_DAC_SetValue 写入的值才会真正输出到引脚 */
   if (HAL_DAC_Start(&hdac, DAC_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
@@ -275,6 +285,7 @@ static void AdcDacVofa_Start(void)
 
 static uint16_t ReadAdcValue(ADC_HandleTypeDef *hadc, uint16_t previous_value)
 {
+  /* 单次轮询读取 ADC。失败时返回上一次值，避免屏幕/输出突然跳到 0 */
   (void)HAL_ADC_Stop(hadc);
   __HAL_ADC_CLEAR_FLAG(hadc, ADC_FLAG_OVR);
 
@@ -297,6 +308,7 @@ static uint16_t ReadAdcValue(ADC_HandleTypeDef *hadc, uint16_t previous_value)
 
 static uint32_t AdcFreq_Update(AdcFreqMeter *meter, uint16_t sample, uint32_t now)
 {
+  /* 先低于低阈值，再高于高阈值，才算一次新的上升穿越；这样能过滤阈值附近的小抖动 */
   if (sample <= ADC_FREQ_LOW_THRESHOLD)
   {
     meter->armed = 1U;
@@ -310,14 +322,17 @@ static uint32_t AdcFreq_Update(AdcFreqMeter *meter, uint16_t sample, uint32_t no
 
       if (period_ms != 0U)
       {
+        /* period_ms 是一个周期的毫秒数，频率约等于 1000 / period_ms，加入半周期用于四舍五入 */
         meter->frequency_hz = (1000U + (period_ms / 2U)) / period_ms;
       }
     }
 
+    /* 记录这次穿越时间，并等待波形重新下降到低阈值后再检测下一次 */
     meter->last_cross_tick = now;
     meter->armed = 0U;
   }
 
+  /* 长时间没有再次穿越阈值，就把频率清零 */
   if ((meter->last_cross_tick == 0U) || ((now - meter->last_cross_tick) > FREQ_TIMEOUT_MS))
   {
     meter->frequency_hz = 0U;
@@ -342,6 +357,8 @@ static void UpdateDacOutputs(uint16_t value1, uint16_t value2)
 static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq)
 {
   char tx_buf[64];
+
+  /* VOFA 以逗号分隔多通道数据：ADC1, ADC2, PA0频率, ADC1频率, ADC2频率 */
   int len = snprintf(tx_buf, sizeof(tx_buf), "%u,%u,%lu,%lu,%lu\r\n",
                      value1,
                      value2,
@@ -357,6 +374,7 @@ static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa0_freq
 
 static void LcdDisplay_Init(void)
 {
+  /* LCD 只初始化一次，静态边框先画好，后续只刷新数值和波形 */
   LCD_Init();
   LcdDrawStatic();
   LcdDrawValues(0U, 0U, 0U, 0U, 0U);
@@ -368,10 +386,12 @@ static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2, ui
 
   if ((now - last_lcd_tick) < LCD_REFRESH_PERIOD_MS)
   {
+    /* LCD 刷新比 ADC 慢很多，过快刷新会闪烁并拖慢任务 */
     return;
   }
 
   last_lcd_tick = now;
+  /* 先刷新上方数值，再重画两条波形 */
   LcdDrawValues(value1, value2, pa0_freq, adc1_freq, adc2_freq);
   LcdDrawWaveform(LCD_ADC1_TOP, lcd_adc1_wave, BLUE);
   LcdDrawWaveform(LCD_ADC2_TOP, lcd_adc2_wave, RED);
@@ -379,6 +399,7 @@ static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2, ui
 
 static void LcdPushSamples(uint16_t value1, uint16_t value2)
 {
+  /* 环形缓冲区：写到末尾后从头覆盖，用固定内存保存最近一屏波形 */
   lcd_adc1_wave[lcd_wave_index] = value1;
   lcd_adc2_wave[lcd_wave_index] = value2;
 
@@ -396,6 +417,7 @@ static void LcdPushSamples(uint16_t value1, uint16_t value2)
 
 static void LcdDrawStatic(void)
 {
+  /* 静态内容：标题和两条波形的坐标框 */
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
   LCD_Clear(WHITE);
@@ -409,6 +431,7 @@ static void LcdDrawValues(uint16_t value1, uint16_t value2, uint32_t pa0_freq, u
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
 
+  /* 清除数值区域，避免新旧数字位数不同导致残影 */
   LCD_Fill(0, 22, 319, 63, WHITE);
 
   LCD_ShowString(8, 22, 18, 12, 12, (uint8_t *)"A1");
@@ -427,6 +450,7 @@ static void LcdDrawValues(uint16_t value1, uint16_t value2, uint32_t pa0_freq, u
 
 static void LcdDrawFrequency(uint16_t x, uint16_t y, uint32_t freq)
 {
+  /* 小于 100k 显示 Hz，大于等于 100k 显示 kHz，减少屏幕占用宽度 */
   if (freq < 100000U)
   {
     LCD_ShowNum(x, y, freq, 5, 12);
@@ -441,6 +465,7 @@ static void LcdDrawFrequency(uint16_t x, uint16_t y, uint32_t freq)
 
 static void LcdDrawWaveFrame(uint16_t top, const char *label, uint16_t color)
 {
+  /* 波形框包含外框和中线，中线大约对应 ADC 半量程 */
   uint16_t bottom = top + LCD_WAVE_HEIGHT - 1U;
   uint16_t right = LCD_WAVE_LEFT + LCD_WAVE_WIDTH - 1U;
   uint16_t mid = top + LCD_WAVE_HEIGHT / 2U;
@@ -464,6 +489,7 @@ static void LcdDrawWaveform(uint16_t top, const uint16_t *samples, uint16_t colo
   uint16_t last_x = LCD_WAVE_LEFT;
   uint16_t last_y;
 
+  /* 只清除波形框内部，边框随后重画，避免整屏闪烁 */
   LCD_Fill(LCD_WAVE_LEFT + 1U, top + 1U, right - 1U, bottom - 1U, WHITE);
   LcdDrawWaveFrame(top, top == LCD_ADC1_TOP ? "ADC1 PA2 -> DAC1 PA4" : "ADC2 PA3 -> DAC2 PA5", color);
 
@@ -474,6 +500,7 @@ static void LcdDrawWaveform(uint16_t top, const uint16_t *samples, uint16_t colo
 
   if (lcd_wave_count >= LCD_WAVE_POINTS)
   {
+    /* 缓冲区满后，从最旧的点开始画，屏幕上看到的是连续时间顺序 */
     start = lcd_wave_index;
   }
 
@@ -494,6 +521,7 @@ static void LcdDrawWaveform(uint16_t top, const uint16_t *samples, uint16_t colo
 
 static uint16_t LcdAdcToY(uint16_t value, uint16_t top)
 {
+  /* ADC 越大，屏幕 y 坐标越小，所以这里要反向映射 */
   uint32_t y_span = LCD_WAVE_HEIGHT - 3U;
   uint32_t y = top + 1U + y_span - ((uint32_t)value * y_span) / ADC_MAX_CODE;
 
@@ -502,22 +530,26 @@ static uint16_t LcdAdcToY(uint16_t value, uint16_t top)
 
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
+  /* PA0 接到 TIM5_CH1。每来一个上升沿，硬件会把当前计数值锁存到捕获寄存器 */
   if ((htim->Instance == TIM5) && (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1))
   {
     uint32_t capture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
 
     if (tim5_capture_ready != 0U)
     {
+      /* 两次捕获值的差就是一个周期的计数。TIM5 是 32 位，uint32_t 自然溢出也能得到正确差值 */
       uint32_t delta = capture - tim5_last_capture;
 
       if (delta != 0U)
       {
+        /* TIM5_COUNTER_HZ 是 1MHz，所以频率 = 1000000 / 周期计数 */
         frequency_hz = TIM5_COUNTER_HZ / delta;
         frequency_last_capture_tick = HAL_GetTick();
       }
     }
     else
     {
+      /* 第一次捕获还没有上一次数据，只能作为基准保存 */
       tim5_capture_ready = 1U;
       frequency_last_capture_tick = HAL_GetTick();
     }

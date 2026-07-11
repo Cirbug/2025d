@@ -42,9 +42,9 @@ void MX_TIM5_Init(void)
 
   /* USER CODE END TIM5_Init 1 */
   htim5.Instance = TIM5;
-  htim5.Init.Prescaler = 84-1;
+  htim5.Init.Prescaler = 84-1; /* APB1 定时器时钟 84MHz，84 分频后 TIM5 计数频率为 1MHz */
   htim5.Init.CounterMode = TIM_COUNTERMODE_UP;
-  htim5.Init.Period = 0xFFFFFFFF;
+  htim5.Init.Period = 0xFFFFFFFF; /* TIM5 是 32 位定时器，计满溢出时间很长，适合测频 */
   htim5.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
   htim5.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
   if (HAL_TIM_Base_Init(&htim5) != HAL_OK)
@@ -66,10 +66,10 @@ void MX_TIM5_Init(void)
   {
     Error_Handler();
   }
-  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING;
-  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;
-  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;
-  sConfigIC.ICFilter = 0;
+  sConfigIC.ICPolarity = TIM_INPUTCHANNELPOLARITY_RISING; /* 捕获上升沿 */
+  sConfigIC.ICSelection = TIM_ICSELECTION_DIRECTTI;       /* 直接使用 TIM5_CH1 引脚输入 */
+  sConfigIC.ICPrescaler = TIM_ICPSC_DIV1;                 /* 每个有效边沿都捕获 */
+  sConfigIC.ICFilter = 0;                                 /* 不加数字滤波，输入抖动大时可适当调大 */
   if (HAL_TIM_IC_ConfigChannel(&htim5, &sConfigIC, TIM_CHANNEL_1) != HAL_OK)
   {
     Error_Handler();
@@ -94,7 +94,7 @@ void HAL_TIM_Base_MspInit(TIM_HandleTypeDef* tim_baseHandle)
 
     __HAL_RCC_GPIOA_CLK_ENABLE();
     /**TIM5 GPIO Configuration
-    PA0     ------> TIM5_CH1
+    PA0     ------> TIM5_CH1，外部待测方波/整形后的信号从这里输入
     */
     GPIO_InitStruct.Pin = GPIO_PIN_0;
     GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;

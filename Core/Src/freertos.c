@@ -51,7 +51,7 @@
 osThreadId_t ADCDACTaskHandle;
 const osThreadAttr_t ADCDACTask_attributes = {
   .name = "ADCDACTask",
-  .stack_size = 1024 * 4, /* 这个任务里有 LCD 刷新和 snprintf，栈给大一点更稳 */
+  .stack_size = 1024 * 4,
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for VofaTask */

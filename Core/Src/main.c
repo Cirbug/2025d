@@ -30,6 +30,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "lcd.h"
+#include "touch.h"
 #include <stdio.h>
 
 /* USER CODE END Includes */
@@ -77,12 +78,13 @@ static uint16_t lcd_adc1_wave[LCD_WAVE_POINTS];          /* LCD 上 ADC1 波形�
 static uint16_t lcd_adc2_wave[LCD_WAVE_POINTS];          /* LCD 上 ADC2 波形的环形缓冲区 */
 static uint16_t lcd_wave_index = 0U;                     /* 下一次写入波形缓冲区的位置 */
 static uint16_t lcd_wave_count = 0U;                     /* 当前已经累计的有效波形点数 */
-static volatile uint32_t frequency_hz = 0U;              /* PA0/TIM5 输入捕获测得的频率 */
-static volatile uint32_t frequency_last_capture_tick = 0U; /* PA0 最近一次捕获到边沿的 tick */
+static volatile uint32_t frequency_hz = 0U;              /* PA1/TIM5 输入捕获测得的频率 */
+static volatile uint32_t frequency_last_capture_tick = 0U; /* PA1 最近一次捕获到边沿的 tick */
 static uint32_t tim5_last_capture = 0U;                  /* TIM5 上一次捕获寄存器值 */
 static uint8_t tim5_capture_ready = 0U;                  /* 第一次捕获只记录基准，第二次开始才可计算周期 */
 static AdcFreqMeter adc1_freq_meter = {1U, 0U, 0U};      /* ADC1 软件测频状态 */
 static AdcFreqMeter adc2_freq_meter = {1U, 0U, 0U};      /* ADC2 软件测频状态 */
+static TouchState touch_state = {0U, 0U, 0U, 0U, 0U};
 
 /* USER CODE END PV */
 
@@ -94,13 +96,14 @@ static void AdcDacVofa_Start(void);
 static uint16_t ReadAdcValue(ADC_HandleTypeDef *hadc, uint16_t previous_value);
 static uint32_t AdcFreq_Update(AdcFreqMeter *meter, uint16_t sample, uint32_t now);
 static void UpdateDacOutputs(uint16_t value1, uint16_t value2);
-static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq);
+static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa1_freq, uint32_t adc1_freq, uint32_t adc2_freq);
 static void LcdDisplay_Init(void);
-static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq);
+static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t pa1_freq, uint32_t adc1_freq, uint32_t adc2_freq);
 static void LcdPushSamples(uint16_t value1, uint16_t value2);
 static void LcdDrawStatic(void);
-static void LcdDrawValues(uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq);
+static void LcdDrawValues(uint16_t value1, uint16_t value2, uint32_t pa1_freq, uint32_t adc1_freq, uint32_t adc2_freq);
 static void LcdDrawFrequency(uint16_t x, uint16_t y, uint32_t freq);
+static void LcdDrawSignedValue(uint16_t x, uint16_t y, int32_t value);
 static void LcdDrawWaveFrame(uint16_t top, const char *label, uint16_t color);
 static void LcdDrawWaveform(uint16_t top, const uint16_t *samples, uint16_t color);
 static uint16_t LcdAdcToY(uint16_t value, uint16_t top);
@@ -223,11 +226,12 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 void App_Init(void)
 {
-  /* FreeRTOS 任务启动后先初始化 LCD、DAC，再打开 PA0 的 TIM5 输入捕获中断 */
+  /* FreeRTOS 任务启动后先初始化 LCD、DAC，再打开 PA1 的 TIM5 输入捕获中断 */
   LcdDisplay_Init();
+  Touch_Init();
   AdcDacVofa_Start();
 
-  if (HAL_TIM_IC_Start_IT(&htim5, TIM_CHANNEL_1) != HAL_OK)
+  if (HAL_TIM_IC_Start_IT(&htim5, TIM_CHANNEL_2) != HAL_OK)
   {
     Error_Handler();
   }
@@ -236,13 +240,14 @@ void App_Init(void)
 void App_TaskStep(void)
 {
   static uint32_t last_vofa_tick = 0U;
+  static uint32_t last_touch_tick = 0U;
   uint32_t now = HAL_GetTick();
-  uint32_t pa0_freq = frequency_hz;
+  uint32_t pa1_freq = frequency_hz;
 
-  /* PA0 如果 1 秒没有捕获到新边沿，说明输入信号停止或频率太低，显示为 0Hz */
+  /* PA1 如果 1 秒没有捕获到新边沿，说明输入信号停止或频率太低，显示为 0Hz */
   if ((now - frequency_last_capture_tick) > FREQ_TIMEOUT_MS)
   {
-    pa0_freq = 0U;
+    pa1_freq = 0U;
     frequency_hz = 0U;
   }
 
@@ -254,18 +259,24 @@ void App_TaskStep(void)
   uint32_t adc1_freq = AdcFreq_Update(&adc1_freq_meter, adc1_value, now);
   uint32_t adc2_freq = AdcFreq_Update(&adc2_freq_meter, adc2_value, now);
 
+  if ((now - last_touch_tick) >= 20U)
+  {
+    last_touch_tick = now;
+    (void)Touch_Scan(&touch_state);
+  }
+
   /* DAC 输出跟随 ADC：ADC1 -> DAC1(PA4)，ADC2 -> DAC2(PA5) */
   UpdateDacOutputs(adc1_value, adc2_value);
 
   /* LCD 不需要每 1ms 都刷，函数内部会按 LCD_REFRESH_PERIOD_MS 限速 */
-  LcdDisplay_Update(now, adc1_value, adc2_value, pa0_freq, adc1_freq, adc2_freq);
+  LcdDisplay_Update(now, adc1_value, adc2_value, pa1_freq, adc1_freq, adc2_freq);
 
   if ((now - last_vofa_tick) >= VOFA_SEND_PERIOD_MS)
   {
     last_vofa_tick = now;
     /* 波形点和 VOFA 数据都按 VOFA_SEND_PERIOD_MS 推进 */
     LcdPushSamples(adc1_value, adc2_value);
-    Vofa_SendSamples(adc1_value, adc2_value, pa0_freq, adc1_freq, adc2_freq);
+    Vofa_SendSamples(adc1_value, adc2_value, pa1_freq, adc1_freq, adc2_freq);
   }
 }
 
@@ -354,15 +365,15 @@ static void UpdateDacOutputs(uint16_t value1, uint16_t value2)
   }
 }
 
-static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq)
+static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa1_freq, uint32_t adc1_freq, uint32_t adc2_freq)
 {
   char tx_buf[64];
 
-  /* VOFA 以逗号分隔多通道数据：ADC1, ADC2, PA0频率, ADC1频率, ADC2频率 */
+  /* VOFA 以逗号分隔多通道数据：ADC1, ADC2, PA1频率, ADC1频率, ADC2频率 */
   int len = snprintf(tx_buf, sizeof(tx_buf), "%u,%u,%lu,%lu,%lu\r\n",
                      value1,
                      value2,
-                     (unsigned long)pa0_freq,
+                     (unsigned long)pa1_freq,
                      (unsigned long)adc1_freq,
                      (unsigned long)adc2_freq);
 
@@ -380,7 +391,7 @@ static void LcdDisplay_Init(void)
   LcdDrawValues(0U, 0U, 0U, 0U, 0U);
 }
 
-static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq)
+static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t pa1_freq, uint32_t adc1_freq, uint32_t adc2_freq)
 {
   static uint32_t last_lcd_tick = 0U;
 
@@ -392,7 +403,7 @@ static void LcdDisplay_Update(uint32_t now, uint16_t value1, uint16_t value2, ui
 
   last_lcd_tick = now;
   /* 先刷新上方数值，再重画两条波形 */
-  LcdDrawValues(value1, value2, pa0_freq, adc1_freq, adc2_freq);
+  LcdDrawValues(value1, value2, pa1_freq, adc1_freq, adc2_freq);
   LcdDrawWaveform(LCD_ADC1_TOP, lcd_adc1_wave, BLUE);
   LcdDrawWaveform(LCD_ADC2_TOP, lcd_adc2_wave, RED);
 }
@@ -426,8 +437,10 @@ static void LcdDrawStatic(void)
   LcdDrawWaveFrame(LCD_ADC2_TOP, "ADC2 PA3 -> DAC2 PA5", RED);
 }
 
-static void LcdDrawValues(uint16_t value1, uint16_t value2, uint32_t pa0_freq, uint32_t adc1_freq, uint32_t adc2_freq)
+static void LcdDrawValues(uint16_t value1, uint16_t value2, uint32_t pa1_freq, uint32_t adc1_freq, uint32_t adc2_freq)
 {
+  int32_t adc_diff = (int32_t)value1 - (int32_t)value2;
+
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
 
@@ -444,8 +457,21 @@ static void LcdDrawValues(uint16_t value1, uint16_t value2, uint32_t pa0_freq, u
   LCD_ShowString(76, 36, 18, 12, 12, (uint8_t *)"F2");
   LcdDrawFrequency(96, 36, adc2_freq);
 
-  LCD_ShowString(8, 50, 18, 12, 12, (uint8_t *)"P0");
-  LcdDrawFrequency(30, 50, pa0_freq);
+  LCD_ShowString(8, 50, 18, 12, 12, (uint8_t *)"P1");
+  LcdDrawFrequency(30, 50, pa1_freq);
+  LCD_ShowString(120, 50, 12, 12, 12, (uint8_t *)"D");
+  LcdDrawSignedValue(138, 50, adc_diff);
+  LCD_ShowString(196, 50, 12, 12, 12, (uint8_t *)"T");
+  if (touch_state.pressed != 0U)
+  {
+    LCD_ShowNum(214, 50, touch_state.x, 3, 12);
+    LCD_ShowString(234, 50, 6, 12, 12, (uint8_t *)",");
+    LCD_ShowNum(242, 50, touch_state.y, 3, 12);
+  }
+  else
+  {
+    LCD_ShowString(214, 50, 48, 12, 12, (uint8_t *)"----");
+  }
 }
 
 static void LcdDrawFrequency(uint16_t x, uint16_t y, uint32_t freq)
@@ -461,6 +487,25 @@ static void LcdDrawFrequency(uint16_t x, uint16_t y, uint32_t freq)
     LCD_ShowNum(x, y, freq / 1000U, 5, 12);
     LCD_ShowString(x + 34U, y, 24, 12, 12, (uint8_t *)"kHz");
   }
+}
+
+static void LcdDrawSignedValue(uint16_t x, uint16_t y, int32_t value)
+{
+  uint32_t abs_value;
+
+  /* D 显示 ADC1 - ADC2，差值可能为负数，所以单独画正负号 */
+  if (value < 0)
+  {
+    LCD_ShowString(x, y, 6, 12, 12, (uint8_t *)"-");
+    abs_value = (uint32_t)(-value);
+  }
+  else
+  {
+    LCD_ShowString(x, y, 6, 12, 12, (uint8_t *)"+");
+    abs_value = (uint32_t)value;
+  }
+
+  LCD_ShowNum(x + 8U, y, abs_value, 4, 12);
 }
 
 static void LcdDrawWaveFrame(uint16_t top, const char *label, uint16_t color)
@@ -530,10 +575,10 @@ static uint16_t LcdAdcToY(uint16_t value, uint16_t top)
 
 void HAL_TIM_IC_CaptureCallback(TIM_HandleTypeDef *htim)
 {
-  /* PA0 接到 TIM5_CH1。每来一个上升沿，硬件会把当前计数值锁存到捕获寄存器 */
-  if ((htim->Instance == TIM5) && (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_1))
+  /* PA1 接到 TIM5_CH2。每来一个上升沿，硬件会把当前计数值锁存到捕获寄存器 */
+  if ((htim->Instance == TIM5) && (htim->Channel == HAL_TIM_ACTIVE_CHANNEL_2))
   {
-    uint32_t capture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_1);
+    uint32_t capture = HAL_TIM_ReadCapturedValue(htim, TIM_CHANNEL_2);
 
     if (tim5_capture_ready != 0U)
     {

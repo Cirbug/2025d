@@ -73,6 +73,8 @@ typedef enum
 #define ADC_KALMAN_R 25.0f              /* ADC 卡尔曼测量噪声，越大滤波越强 */
 #define PA1_KALMAN_Q 100.0f             /* PA1 频率卡尔曼过程噪声 */
 #define PA1_KALMAN_R 2500.0f            /* PA1 频率卡尔曼测量噪声 */
+#define DIFF_VOLTAGE_SCALE 2.0f         /* 差分 ADC 值乘 2 后作为电压采样值，单位 mV */
+#define MEASURE_CURRENT_MA 330.0f       /* 双端测量使用的恒定电流，单位 mA */
 #define LENGTH_SCALE_X1000 21461918UL   /* 新标定曲线系数，内部长度单位为 0.001m */
 #define LENGTH_OFFSET_X1000 253UL       /* 新标定曲线偏移量 0.253m */
 #define LENGTH_MAX_X10 500U             /* 最大测量长度 50.0m */
@@ -530,9 +532,9 @@ static void Ui_DrawPageStatic(void)
   else if (current_page == UI_PAGE_DOUBLE)
   {
     LCD_ShowString(94, 12, 132, 24, 24, (uint8_t *)"DOUBLE END");
-    LCD_ShowString(52, 62, 72, 24, 24, (uint8_t *)"ADC1 :");
-    LCD_ShowString(52, 105, 72, 24, 24, (uint8_t *)"ADC2 :");
-    LCD_ShowString(52, 148, 72, 24, 24, (uint8_t *)"DIFF :");
+    LCD_ShowString(52, 62, 72, 24, 24, (uint8_t *)"DIFF :");
+    LCD_ShowString(52, 105, 72, 24, 24, (uint8_t *)"VOLT :");
+    LCD_ShowString(52, 148, 60, 24, 24, (uint8_t *)"RES :");
   }
   /* 首页内容区按需求暂时留空。 */
 
@@ -635,13 +637,27 @@ static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10)
 static void Ui_DrawDoubleValues(uint16_t value1, uint16_t value2)
 {
   int32_t difference = (int32_t)value1 - (int32_t)value2;
+  uint32_t absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
+  float voltage_mv = (float)absolute_difference * DIFF_VOLTAGE_SCALE;
+  float resistance_ohm = voltage_mv / MEASURE_CURRENT_MA;
+  uint32_t voltage_display = (uint32_t)(voltage_mv + 0.5f);
+  uint32_t resistance_x100 = (uint32_t)(resistance_ohm * 100.0f + 0.5f);
 
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
-  LCD_Fill(136, 60, 270, 178, WHITE);
-  LCD_ShowNum(150, 62, value1, 4, 24);
-  LCD_ShowNum(150, 105, value2, 4, 24);
-  Ui_DrawSignedValue(150, 148, difference, 24U);
+  LCD_Fill(136, 60, 285, 178, WHITE);
+
+  /* DIFF 保留正负号，表示 ADC1 相对于 ADC2 的极性。 */
+  Ui_DrawSignedValue(150, 62, difference, 24U);
+
+  /* mV/mA 的数值关系等同于欧姆，因此可直接计算电阻。 */
+  LCD_ShowNum(150, 105, voltage_display, 4, 24);
+  LCD_ShowString(206, 105, 24, 24, 24, (uint8_t *)"mV");
+
+  LCD_ShowNum(150, 148, resistance_x100 / 100U, 2, 24);
+  LCD_ShowString(174, 148, 12, 24, 24, (uint8_t *)".");
+  LCD_ShowxNum(186, 148, resistance_x100 % 100U, 2, 24, 0x80U);
+  LCD_ShowString(214, 148, 36, 24, 24, (uint8_t *)"ohm");
 }
 
 static void Ui_DrawLargeFrequency(uint16_t x, uint16_t y, uint32_t freq)

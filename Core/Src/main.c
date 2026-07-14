@@ -55,10 +55,21 @@ typedef enum
   UI_PAGE_CALIBRATION
 } UiPage;
 
+typedef enum
+{
+  CABLE_WIRING_UNKNOWN = 0,
+  CABLE_WIRING_STRAIGHT,
+  CABLE_WIRING_CROSS,
+  CABLE_WIRING_FAULT
+} CableWiringType;
+
 typedef struct
 {
   uint8_t valid;
   uint8_t frequency_valid;
+  uint8_t cable_valid;
+  uint8_t cable_shielded;
+  CableWiringType cable_wiring;
   uint32_t frequency_hz;
   int32_t difference;
 } UiMeasurementResult;
@@ -133,6 +144,8 @@ typedef struct
 #define LENGTH_OFFSET_X1000 253UL       /* 新标定曲线偏移量 0.253m */
 #define LENGTH_MAX_X10 500U             /* 最大测量长度 50.0m */
 #define LENGTH_INVALID_X10 0xFFFFU      /* 没有频率输入时的无效长度 */
+#define CABLE_WIRE_COUNT 2U              /* 简化方案只检测第 1、2 芯 */
+#define CABLE_SAMPLE_COUNT 5U            /* 每个状态连续读取 5 次，使用多数结果抗抖动 */
 
 /* USER CODE END PD */
 
@@ -183,6 +196,22 @@ static uint8_t spi_flash_ready = 0U;
 static uint16_t spi_flash_id = 0U;
 static uint8_t calibration_mode = 0U;                    /* 0单端校准，1双端校准 */
 static uint8_t calibration_selected_point = 0U;
+static GPIO_TypeDef *const cable_output_ports[CABLE_WIRE_COUNT] =
+{
+  OUT1_GPIO_Port, OUT2_GPIO_Port
+};
+static const uint16_t cable_output_pins[CABLE_WIRE_COUNT] =
+{
+  OUT1_Pin, OUT2_Pin
+};
+static GPIO_TypeDef *const cable_input_ports[CABLE_WIRE_COUNT] =
+{
+  IN1_GPIO_Port, IN2_GPIO_Port
+};
+static const uint16_t cable_input_pins[CABLE_WIRE_COUNT] =
+{
+  IN1_Pin, IN2_Pin
+};
 
 /* USER CODE END PV */
 
@@ -207,7 +236,7 @@ static void Ui_DrawCalibrationPage(void);
 static void Ui_DrawCalibrationValues(void);
 static void Ui_HandleCalibrationTouch(uint16_t x, uint16_t y);
 static void Ui_DrawSingleValue(uint32_t pa1_freq);
-static void Ui_DrawDoubleValue(int32_t difference);
+static void Ui_DrawDoubleValue(const UiMeasurementResult *result);
 static void Ui_DrawLargeFrequency(uint16_t x, uint16_t y, uint32_t freq);
 static void Ui_DrawSignedValue(uint16_t x, uint16_t y, int32_t value, uint8_t size);
 static uint16_t CalculateLengthX10(uint32_t frequency);
@@ -231,6 +260,10 @@ static void Calibration_Load(void);
 static uint32_t Calibration_Checksum(const CalibrationStorage *data);
 static uint8_t Calibration_GetLength(float resistance_ohm, float *length_m);
 static uint8_t SingleCalibration_GetLength(uint32_t frequency_hz, float *length_m);
+static void CableTest_Run(UiMeasurementResult *result);
+static void CableTest_SetAllOutputsHighImpedance(void);
+static void CableTest_EnableOutput(uint8_t index);
+static void CableTest_RestoreOutputs(void);
 void App_Init(void);
 void App_TaskStep(void);
 
@@ -554,6 +587,9 @@ static void Measurement_Start(uint32_t now)
   difference_sample_count = 0U;
   measurement_results[measurement_page].valid = 0U;
   measurement_results[measurement_page].frequency_valid = 0U;
+  measurement_results[measurement_page].cable_valid = 0U;
+  measurement_results[measurement_page].cable_shielded = 0U;
+  measurement_results[measurement_page].cable_wiring = CABLE_WIRING_UNKNOWN;
   measurement_running = 1U;
   page_dirty = 1U;
 }
@@ -601,8 +637,163 @@ static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1,
     result->valid = (difference_sample_count != 0U) ? 1U : 0U;
   }
 
+  /* 双端 RUN 完成电阻采样后，再扫描第 1、2 芯线序和屏蔽层。 */
+  if (measurement_page == UI_PAGE_DOUBLE)
+  {
+    CableTest_Run(result);
+  }
+
   measurement_running = 0U;
   page_dirty = 1U;
+}
+
+static void CableTest_SetAllOutputsHighImpedance(void)
+{
+  GPIO_InitTypeDef gpio_init = {0};
+
+  /*
+   * 扫描期间未使用的发送脚全部改为高阻输入。
+   * 这样即使网线内部错接或两芯短路，也不会出现一个 GPIO 输出高、另一个输出低的对冲。
+   */
+  gpio_init.Mode = GPIO_MODE_INPUT;
+  gpio_init.Pull = GPIO_NOPULL;
+  gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
+
+  for (uint8_t i = 0U; i < CABLE_WIRE_COUNT; ++i)
+  {
+    gpio_init.Pin = cable_output_pins[i];
+    HAL_GPIO_Init(cable_output_ports[i], &gpio_init);
+  }
+}
+
+static void CableTest_EnableOutput(uint8_t index)
+{
+  GPIO_InitTypeDef gpio_init = {0};
+
+  if (index >= CABLE_WIRE_COUNT)
+  {
+    return;
+  }
+
+  /* 先把输出锁存器置高，再切换成推挽输出，避免切换瞬间产生低脉冲。 */
+  HAL_GPIO_WritePin(cable_output_ports[index], cable_output_pins[index], GPIO_PIN_SET);
+  gpio_init.Pin = cable_output_pins[index];
+  gpio_init.Mode = GPIO_MODE_OUTPUT_PP;
+  gpio_init.Pull = GPIO_NOPULL;
+  gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(cable_output_ports[index], &gpio_init);
+}
+
+static void CableTest_RestoreOutputs(void)
+{
+  GPIO_InitTypeDef gpio_init = {0};
+
+  /* 扫描结束后恢复 IOC 中的默认状态：OUT1、OUT2 推挽输出并保持低电平。 */
+  gpio_init.Mode = GPIO_MODE_OUTPUT_PP;
+  gpio_init.Pull = GPIO_NOPULL;
+  gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
+
+  for (uint8_t i = 0U; i < CABLE_WIRE_COUNT; ++i)
+  {
+    HAL_GPIO_WritePin(cable_output_ports[i], cable_output_pins[i], GPIO_PIN_RESET);
+    gpio_init.Pin = cable_output_pins[i];
+    HAL_GPIO_Init(cable_output_ports[i], &gpio_init);
+  }
+}
+
+static void CableTest_Run(UiMeasurementResult *result)
+{
+  static const uint8_t cross_input_index[CABLE_WIRE_COUNT] =
+  {
+    1U, 0U
+  };
+  uint8_t input_masks[CABLE_WIRE_COUNT] = {0U};
+  uint8_t straight = 1U;
+  uint8_t cross = 1U;
+  uint8_t shield_high_count = 0U;
+
+  if (result == NULL)
+  {
+    return;
+  }
+
+  CableTest_SetAllOutputsHighImpedance();
+
+  for (uint8_t output = 0U; output < CABLE_WIRE_COUNT; ++output)
+  {
+    uint8_t high_counts[CABLE_WIRE_COUNT] = {0U};
+
+    CableTest_EnableOutput(output);
+    (void)osDelay(1U); /* 等待电平经过网线稳定到接收端 */
+
+    for (uint8_t sample = 0U; sample < CABLE_SAMPLE_COUNT; ++sample)
+    {
+      for (uint8_t input = 0U; input < CABLE_WIRE_COUNT; ++input)
+      {
+        if (HAL_GPIO_ReadPin(cable_input_ports[input], cable_input_pins[input]) == GPIO_PIN_SET)
+        {
+          high_counts[input]++;
+        }
+      }
+      (void)osDelay(1U);
+    }
+
+    for (uint8_t input = 0U; input < CABLE_WIRE_COUNT; ++input)
+    {
+      if (high_counts[input] > (CABLE_SAMPLE_COUNT / 2U))
+      {
+        input_masks[output] |= (uint8_t)(1U << input);
+      }
+    }
+
+    /* 当前发送脚读完后也恢复高阻，再测试下一芯。 */
+    CableTest_SetAllOutputsHighImpedance();
+    (void)osDelay(1U);
+  }
+
+  /* 外壳接收脚有内部下拉：外部 3.3V 可稳定判为 SFTP，断开则判为 UTP。 */
+  for (uint8_t sample = 0U; sample < CABLE_SAMPLE_COUNT; ++sample)
+  {
+    if (HAL_GPIO_ReadPin(IN_GND_GPIO_Port, IN_GND_Pin) == GPIO_PIN_SET)
+    {
+      shield_high_count++;
+    }
+    (void)osDelay(1U);
+  }
+
+  CableTest_RestoreOutputs();
+
+  for (uint8_t output = 0U; output < CABLE_WIRE_COUNT; ++output)
+  {
+    uint8_t straight_mask = (uint8_t)(1U << output);
+    uint8_t cross_mask = (uint8_t)(1U << cross_input_index[output]);
+
+    if (input_masks[output] != straight_mask)
+    {
+      straight = 0U;
+    }
+    if (input_masks[output] != cross_mask)
+    {
+      cross = 0U;
+    }
+  }
+
+  result->cable_valid = 1U;
+  result->cable_shielded = (shield_high_count > (CABLE_SAMPLE_COUNT / 2U)) ? 1U : 0U;
+
+  if (straight != 0U)
+  {
+    result->cable_wiring = CABLE_WIRING_STRAIGHT;
+  }
+  else if (cross != 0U)
+  {
+    result->cable_wiring = CABLE_WIRING_CROSS;
+  }
+  else
+  {
+    /* 没有信号、只有一路导通或两芯短路都显示为故障，避免误判成交叉线。 */
+    result->cable_wiring = CABLE_WIRING_FAULT;
+  }
 }
 
 static uint32_t MedianU32(uint32_t *values, uint16_t count)
@@ -1109,7 +1300,7 @@ static void Ui_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t p
   }
   else if (current_page == UI_PAGE_DOUBLE)
   {
-    Ui_DrawDoubleValue(result->valid != 0U ? result->difference : 0);
+    Ui_DrawDoubleValue(result);
   }
 }
 
@@ -1194,10 +1385,12 @@ static void Ui_DrawPageStatic(void)
   else if (current_page == UI_PAGE_DOUBLE)
   {
     LCD_ShowString(94, 12, 132, 24, 24, (uint8_t *)"DOUBLE END");
-    LCD_ShowString(52, 52, 48, 16, 16, (uint8_t *)"DIFF:");
-    LCD_ShowString(52, 84, 48, 16, 16, (uint8_t *)"VOLT:");
-    LCD_ShowString(52, 116, 40, 16, 16, (uint8_t *)"RES:");
-    LCD_ShowString(52, 148, 56, 16, 16, (uint8_t *)"LENGTH:");
+    LCD_ShowString(38, 46, 48, 16, 16, (uint8_t *)"DIFF:");
+    LCD_ShowString(38, 70, 48, 16, 16, (uint8_t *)"VOLT:");
+    LCD_ShowString(38, 94, 40, 16, 16, (uint8_t *)"RES:");
+    LCD_ShowString(38, 118, 56, 16, 16, (uint8_t *)"LENGTH:");
+    LCD_ShowString(38, 146, 40, 16, 16, (uint8_t *)"TYPE:");
+    LCD_ShowString(38, 170, 40, 16, 16, (uint8_t *)"WIRE:");
   }
   else
   {
@@ -1653,42 +1846,74 @@ static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10)
   LCD_ShowString(x + 52U, y, 12, 24, 24, (uint8_t *)"m");
 }
 
-static void Ui_DrawDoubleValue(int32_t difference)
+static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
 {
-  uint32_t absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
-  float voltage_mv = (float)absolute_difference * DIFF_VOLTAGE_SCALE;
-  float resistance_ohm = DifferenceToResistance(difference);
+  int32_t difference;
+  uint32_t absolute_difference;
+  float voltage_mv;
+  float resistance_ohm;
   float line_length_m = 0.0f;
-  uint32_t voltage_display = (uint32_t)(voltage_mv + 0.5f);
-  uint32_t resistance_x100 = (uint32_t)(resistance_ohm * 100.0f + 0.5f);
+  uint32_t voltage_display;
+  uint32_t resistance_x100;
   uint32_t length_x10;
+
+  if ((result == NULL) || (result->valid == 0U))
+  {
+    return;
+  }
+
+  difference = result->difference;
+  absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
+  voltage_mv = (float)absolute_difference * DIFF_VOLTAGE_SCALE;
+  resistance_ohm = DifferenceToResistance(difference);
+  voltage_display = (uint32_t)(voltage_mv + 0.5f);
+  resistance_x100 = (uint32_t)(resistance_ohm * 100.0f + 0.5f);
 
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
 
   /* DIFF 保留正负号，表示 ADC1 相对于 ADC2 的极性。 */
-  Ui_DrawSignedValue(130, 52, difference, 16U);
+  Ui_DrawSignedValue(118, 46, difference, 16U);
 
   /* mV/mA 的数值关系等同于欧姆，因此可直接计算电阻。 */
-  LCD_ShowNum(130, 84, voltage_display, 4, 16);
-  LCD_ShowString(170, 84, 16, 16, 16, (uint8_t *)"mV");
+  LCD_ShowNum(118, 70, voltage_display, 4, 16);
+  LCD_ShowString(158, 70, 16, 16, 16, (uint8_t *)"mV");
 
-  LCD_ShowNum(130, 116, resistance_x100 / 100U, 2, 16);
-  LCD_ShowString(146, 116, 8, 16, 16, (uint8_t *)".");
-  LCD_ShowxNum(154, 116, resistance_x100 % 100U, 2, 16, 0x80U);
-  LCD_ShowString(174, 116, 24, 16, 16, (uint8_t *)"ohm");
+  LCD_ShowNum(118, 94, resistance_x100 / 100U, 2, 16);
+  LCD_ShowString(134, 94, 8, 16, 16, (uint8_t *)".");
+  LCD_ShowxNum(142, 94, resistance_x100 % 100U, 2, 16, 0x80U);
+  LCD_ShowString(162, 94, 24, 16, 16, (uint8_t *)"ohm");
 
   if (Calibration_GetLength(resistance_ohm, &line_length_m) != 0U)
   {
     length_x10 = (uint32_t)(line_length_m * 10.0f + 0.5f);
-    LCD_ShowNum(130, 148, length_x10 / 10U, 4, 16);
-    LCD_ShowString(162, 148, 8, 16, 16, (uint8_t *)".");
-    LCD_ShowNum(170, 148, length_x10 % 10U, 1, 16);
-    LCD_ShowString(182, 148, 8, 16, 16, (uint8_t *)"m");
+    LCD_ShowNum(118, 118, length_x10 / 10U, 4, 16);
+    LCD_ShowString(150, 118, 8, 16, 16, (uint8_t *)".");
+    LCD_ShowNum(158, 118, length_x10 % 10U, 1, 16);
+    LCD_ShowString(170, 118, 8, 16, 16, (uint8_t *)"m");
   }
   else
   {
-    LCD_ShowString(130, 148, 48, 16, 16, (uint8_t *)"--.-m");
+    LCD_ShowString(118, 118, 48, 16, 16, (uint8_t *)"--.-m");
+  }
+
+  if (result->cable_valid != 0U)
+  {
+    LCD_ShowString(118, 146, 32, 16, 16,
+                   (uint8_t *)(result->cable_shielded != 0U ? "SFTP" : "UTP"));
+
+    if (result->cable_wiring == CABLE_WIRING_STRAIGHT)
+    {
+      LCD_ShowString(118, 170, 64, 16, 16, (uint8_t *)"STRAIGHT");
+    }
+    else if (result->cable_wiring == CABLE_WIRING_CROSS)
+    {
+      LCD_ShowString(118, 170, 40, 16, 16, (uint8_t *)"CROSS");
+    }
+    else
+    {
+      LCD_ShowString(118, 170, 40, 16, 16, (uint8_t *)"FAULT");
+    }
   }
 }
 

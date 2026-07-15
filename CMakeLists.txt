@@ -32,9 +32,7 @@ message("Build type: " ${CMAKE_BUILD_TYPE})
 enable_language(C ASM)
 
 # Create an executable object type
-add_executable(${CMAKE_PROJECT_NAME}
-    Core/Src/scalar_kalman.c
-    Core/Inc/scalar_kalman.h)
+add_executable(${CMAKE_PROJECT_NAME})
 
 # Add STM32CubeMX generated sources
 add_subdirectory(cmake/stm32cubemx)
@@ -46,14 +44,20 @@ target_link_directories(${CMAKE_PROJECT_NAME} PRIVATE
 
 # Add sources to executable
 target_sources(${CMAKE_PROJECT_NAME} PRIVATE
-    Core/Src/lcd.c
-    Core/Src/touch.c
-    Core/Src/spi_flash.c
+    App/Algorithm/scalar_kalman.c
+    HARDWARE/LCD/lcd.c
+    HARDWARE/TOUCH/touch.c
+    HARDWARE/SPI_FLASH/spi_flash.c
+    HARDWARE/CABLE/cable_gpio.c
 )
 
 # Add include paths
 target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
-    # Add user defined include paths
+    App/Algorithm
+    HARDWARE/LCD
+    HARDWARE/TOUCH
+    HARDWARE/SPI_FLASH
+    HARDWARE/CABLE
 )
 
 # Add project symbols (macros)

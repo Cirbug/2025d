@@ -9,6 +9,7 @@
 void DoubleEndMeasurement_Calculate(int32_t difference,
                                     const CableTestResult *cable,
                                     const DoubleCalibrationData *calibration,
+                                    const DoubleFieldCalibrationData *field_calibration,
                                     DoubleEndMeasurementResult *result)
 {
   uint32_t absolute_difference;
@@ -33,6 +34,7 @@ void DoubleEndMeasurement_Calculate(int32_t difference,
   }
 
   result->length_valid = CalibrationModel_GetDoubleLength(calibration,
+                                                           field_calibration,
                                                            result->resistance_ohm,
                                                            &result->length_m);
 }

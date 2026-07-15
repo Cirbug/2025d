@@ -34,6 +34,11 @@
 #include "touch.h"
 #include "scalar_kalman.h"
 #include "spi_flash.h"
+#include "cable_test_manager.h"
+#include "run_measurement.h"
+#include "calibration_model.h"
+#include "double_end_measurement.h"
+#include "measurement_math.h"
 #include <stdio.h>
 
 /* USER CODE END Includes */
@@ -57,14 +62,6 @@ typedef enum
 
 typedef enum
 {
-  CABLE_WIRING_UNKNOWN = 0,
-  CABLE_WIRING_STRAIGHT,
-  CABLE_WIRING_CROSS,
-  CABLE_WIRING_FAULT
-} CableWiringType;
-
-typedef enum
-{
   CAL_AUTO_NONE = 0,
   CAL_AUTO_ZERO,
   CAL_AUTO_REFERENCE
@@ -74,35 +71,31 @@ typedef struct
 {
   uint8_t valid;
   uint8_t frequency_valid;
-  uint8_t cable_valid;
-  uint8_t cable_shielded;
-  uint8_t cable_output_mask;
-  uint8_t cable_out1_mask;
-  uint8_t cable_out2_mask;
-  CableWiringType cable_wiring;
   uint32_t frequency_hz;
   int32_t difference;
+  DoubleEndMeasurementResult double_end;
 } UiMeasurementResult;
 
-#define CALIBRATION_MAX_POINTS 5U
+/* v2-v4使用的旧校准数组固定为5组，升级后用于迁移原有Flash数据。 */
+#define CALIBRATION_LEGACY_MAX_POINTS 5U
 
 typedef struct
 {
   uint32_t point_count;
-  float length_m[CALIBRATION_MAX_POINTS];
-  float resistance_ohm[CALIBRATION_MAX_POINTS];
+  float length_m[CALIBRATION_LEGACY_MAX_POINTS];
+  float resistance_ohm[CALIBRATION_LEGACY_MAX_POINTS];
   float resistance_per_meter;
   float zero_resistance;
-} DoubleCalibrationData;
+} LegacyDoubleCalibrationData;
 
 typedef struct
 {
   uint32_t point_count;
-  float length_m[CALIBRATION_MAX_POINTS];
-  uint32_t frequency_hz[CALIBRATION_MAX_POINTS];
+  float length_m[CALIBRATION_LEGACY_MAX_POINTS];
+  uint32_t frequency_hz[CALIBRATION_LEGACY_MAX_POINTS];
   float inverse_period_slope;
   float offset_m;
-} SingleCalibrationData;
+} LegacySingleCalibrationData;
 
 typedef struct
 {
@@ -111,16 +104,42 @@ typedef struct
   SingleCalibrationData single;
   DoubleCalibrationData utp;
   DoubleCalibrationData sftp;
+  DoubleFieldCalibrationData utp_field;
+  DoubleFieldCalibrationData sftp_field;
   uint32_t checksum;
 } CalibrationStorage;
+
+/* 版本4：基础拟合与现场校准已经分开，但每种拟合最多保存5组。 */
+typedef struct
+{
+  uint32_t magic;
+  uint32_t version;
+  LegacySingleCalibrationData single;
+  LegacyDoubleCalibrationData utp;
+  LegacyDoubleCalibrationData sftp;
+  DoubleFieldCalibrationData utp_field;
+  DoubleFieldCalibrationData sftp_field;
+  uint32_t checksum;
+} CalibrationStorageV4;
+
+/* 版本3：已有UTP/SFTP基础拟合，但现场校准仍直接覆盖K/B。 */
+typedef struct
+{
+  uint32_t magic;
+  uint32_t version;
+  LegacySingleCalibrationData single;
+  LegacyDoubleCalibrationData utp;
+  LegacyDoubleCalibrationData sftp;
+  uint32_t checksum;
+} CalibrationStorageV3;
 
 /* 旧版 Flash 格式，用于升级时保留原来的一套双端校准数据。 */
 typedef struct
 {
   uint32_t magic;
   uint32_t version;
-  SingleCalibrationData single;
-  DoubleCalibrationData double_end;
+  LegacySingleCalibrationData single;
+  LegacyDoubleCalibrationData double_end;
   uint32_t checksum;
 } CalibrationStorageV2;
 
@@ -138,11 +157,10 @@ typedef struct
 #define UI_RUN_TOP 8U
 #define UI_RUN_RIGHT 311U
 #define UI_RUN_BOTTOM 42U
-#define RUN_DURATION_MS 4000U           /* 每次按 RUN 后采集 4 秒 */
-#define RUN_SAMPLE_PERIOD_MS 20U        /* 每 20ms 保存一个样本 */
-#define RUN_MAX_SAMPLES 200U            /* 4 秒最多保存 200 组样本 */
 #define CALIBRATION_MAGIC 0x43414C32UL   /* Flash 校准数据标志：CAL2 */
-#define CALIBRATION_VERSION 3UL
+#define CALIBRATION_VERSION 5UL
+#define CALIBRATION_VERSION_PREVIOUS 4UL
+#define CALIBRATION_VERSION_V3 3UL
 #define CALIBRATION_VERSION_LEGACY 2UL
 #define CALIBRATION_FLASH_ADDRESS 0x00FFF000UL /* NM25Q128 最后一个 4KB 扇区 */
 #define UTP_REFERENCE_LENGTH_M 50.0f  /* 现场 UTP 参考网线长度 */
@@ -168,11 +186,6 @@ typedef struct
 #define LENGTH_OFFSET_X1000 253UL       /* 新标定曲线偏移量 0.253m */
 #define LENGTH_MAX_X10 500U             /* 最大测量长度 50.0m */
 #define LENGTH_INVALID_X10 0xFFFFU      /* 没有频率输入时的无效长度 */
-#define CABLE_OUTPUT_COUNT 2U            /* 只驱动网线第 1、2 芯 */
-#define CABLE_INPUT_COUNT 4U             /* 读取远端第 1、2、3、6 芯 */
-#define CABLE_SAMPLE_COUNT 5U            /* 每个状态连续读取 5 次，使用多数结果抗抖动 */
-#define CABLE_SETTLE_MS 300U              /* 输出后等待网线和输入电平稳定 */
-#define CABLE_SAMPLE_INTERVAL_MS 240U     /* 每路维持约1.5秒，便于万用表现场排查 */
 
 /* USER CODE END PD */
 
@@ -198,50 +211,37 @@ static uint8_t adc2_kalman_ready = 0U;
 static volatile uint8_t pa1_kalman_ready = 0U;
 static AdcFreqMeter adc1_freq_meter = {1U, 0U, 0U};      /* ADC1 软件测频状态 */
 static AdcFreqMeter adc2_freq_meter = {1U, 0U, 0U};      /* ADC2 软件测频状态 */
+static volatile uint32_t adc1_frequency_hz = 0U;
+static volatile uint32_t adc2_frequency_hz = 0U;
 static TouchState touch_state = {0U, 0U, 0U, 0U, 0U};
 static UiPage current_page = UI_PAGE_HOME;
 static uint8_t page_dirty = 1U;                          /* 切页后需要重画静态内容 */
 static uint8_t touch_was_pressed = 0U;                   /* 用于检测一次新的按下动作 */
 static uint8_t measurement_running = 0U;
 static UiPage measurement_page = UI_PAGE_HOME;
-static uint32_t measurement_start_tick = 0U;
-static uint32_t measurement_last_sample_tick = 0U;
-static uint32_t frequency_samples[RUN_MAX_SAMPLES];
-static int32_t difference_samples[RUN_MAX_SAMPLES];
-static uint16_t frequency_sample_count = 0U;
-static uint16_t difference_sample_count = 0U;
+static RunMeasurement run_measurement;
 static UiMeasurementResult measurement_results[4];
 static DoubleCalibrationData double_calibrations[2];     /* 0=UTP，1=SFTP */
+static DoubleFieldCalibrationData double_field_calibrations[2]; /* 独立现场校准参数 */
 static SingleCalibrationData single_calibration;
 static char calibration_value_input[10];
 static uint8_t calibration_value_input_length = 0U;
 static char calibration_length_input[8];
 static uint8_t calibration_input_length = 0U;
 static uint8_t calibration_active_field = 0U;             /* 0频率/电阻输入，1线长输入 */
-static uint8_t calibration_status = 0U;                  /* 0空闲，1添加，2保存，3错误，4不足，5Flash，6零点，7参考完成，8等待 */
+static uint8_t calibration_status = 0U;                  /* 0空闲，1添加，2保存，3错误，4不足，5Flash，6零点，7参考完成，8等待，9重置 */
 static uint8_t spi_flash_ready = 0U;
 static uint16_t spi_flash_id = 0U;
 static uint8_t calibration_mode = 0U;                    /* 0单端，1=UTP，2=SFTP */
 static uint8_t calibration_view = 0U;                    /* 0多点数据管理，1现场参考线校准 */
 static uint8_t calibration_selected_point = 0U;
 static CalibrationAutoAction calibration_auto_action = CAL_AUTO_NONE;
-static uint8_t calibration_auto_zero_ready[2] = {0U, 0U};
-static GPIO_TypeDef *const cable_output_ports[CABLE_OUTPUT_COUNT] =
-{
-  OUT1_GPIO_Port, OUT2_GPIO_Port
-};
-static const uint16_t cable_output_pins[CABLE_OUTPUT_COUNT] =
-{
-  OUT1_Pin, OUT2_Pin
-};
-static GPIO_TypeDef *const cable_input_ports[CABLE_INPUT_COUNT] =
-{
-  IN1_GPIO_Port, IN2_GPIO_Port, IN3_GPIO_Port, IN6_GPIO_Port
-};
-static const uint16_t cable_input_pins[CABLE_INPUT_COUNT] =
-{
-  IN1_Pin, IN2_Pin, IN3_Pin, IN6_Pin
-};
+static volatile uint8_t cable_scan_pending = 0U;
+static CableTestManager cable_test_manager;
+static CableTestResult cable_test_result;
+static volatile uint8_t storage_save_pending = 0U;
+static volatile uint8_t storage_save_busy = 0U;
+static uint8_t storage_save_success_status = 2U;
 
 /* USER CODE END PV */
 
@@ -275,13 +275,10 @@ static uint16_t CalculateLengthX10(uint32_t frequency);
 static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10);
 static void Measurement_Start(uint32_t now);
 static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1, uint16_t value2);
-static uint32_t MedianU32(uint32_t *values, uint16_t count);
-static int32_t MedianS32(int32_t *values, uint16_t count);
-static float DifferenceToResistance(int32_t difference);
-static uint8_t Calibration_Fit(DoubleCalibrationData *calibration);
-static uint8_t SingleCalibration_Fit(void);
 static DoubleCalibrationData *Calibration_GetActiveDouble(void);
 static const DoubleCalibrationData *Calibration_GetDoubleByShield(uint8_t shielded);
+static DoubleFieldCalibrationData *Calibration_GetActiveField(void);
+static const DoubleFieldCalibrationData *Calibration_GetFieldByShield(uint8_t shielded);
 static float Calibration_ParseText(const char *text, uint8_t text_length);
 static float Calibration_ParseValue(void);
 static float Calibration_ParseLength(void);
@@ -289,20 +286,25 @@ static void Calibration_AppendKey(char key);
 static uint8_t Calibration_AddPoint(void);
 static void Calibration_DeletePoint(void);
 static void Calibration_SelectPoint(int8_t direction);
-static uint8_t Calibration_Save(void);
+static uint8_t Calibration_SaveNow(void);
+static void Calibration_RequestSave(uint8_t success_status);
 static void Calibration_Load(void);
 static uint32_t Calibration_Checksum(const CalibrationStorage *data);
+static uint32_t Calibration_ChecksumV4(const CalibrationStorageV4 *data);
+static uint32_t Calibration_ChecksumV3(const CalibrationStorageV3 *data);
 static uint32_t Calibration_ChecksumV2(const CalibrationStorageV2 *data);
-static uint8_t Calibration_GetLength(float resistance_ohm, uint8_t shielded, float *length_m);
-static uint8_t SingleCalibration_GetLength(uint32_t frequency_hz, float *length_m);
+static void Calibration_ImportLegacySingle(const LegacySingleCalibrationData *source,
+                                           SingleCalibrationData *destination);
+static void Calibration_ImportLegacyDouble(const LegacyDoubleCalibrationData *source,
+                                           DoubleCalibrationData *destination);
 static void Calibration_AutoStart(CalibrationAutoAction action);
 static void Calibration_AutoComplete(int32_t difference);
-static void CableTest_Run(UiMeasurementResult *result);
-static void CableTest_SetAllOutputsHighImpedance(void);
-static void CableTest_EnableOutput(uint8_t index);
-static void CableTest_RestoreOutputs(void);
 void App_Init(void);
-void App_TaskStep(void);
+void App_SamplingTaskStep(void);
+void App_MeasurementTaskStep(void);
+void App_UiTaskStep(void);
+void App_VofaTaskStep(void);
+void App_StorageTaskStep(void);
 
 /* USER CODE END PFP */
 
@@ -348,6 +350,7 @@ int main(void)
   MX_FSMC_Init();
   MX_SPI1_Init();
   MX_TIM5_Init();
+  MX_TIM4_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -437,17 +440,13 @@ void App_Init(void)
   }
 }
 
-void App_TaskStep(void)
+void App_SamplingTaskStep(void)
 {
-  static uint32_t last_vofa_tick = 0U;
-  static uint32_t last_touch_tick = 0U;
   uint32_t now = HAL_GetTick();
-  uint32_t pa1_freq = frequency_hz;
 
   /* PA1 如果 1 秒没有捕获到新边沿，说明输入信号停止或频率太低，显示为 0Hz */
   if ((now - frequency_last_capture_tick) > FREQ_TIMEOUT_MS)
   {
-    pa1_freq = 0U;
     frequency_hz = 0U;
     pa1_kalman_ready = 0U;
   }
@@ -459,30 +458,68 @@ void App_TaskStep(void)
   adc2_value = FilterAdcValue(&adc2_kalman, &adc2_kalman_ready, adc2_sample);
 
   /* 用 ADC 采样值做软件测频。这个方法适合低频，采样间隔越稳定越准 */
-  uint32_t adc1_freq = AdcFreq_Update(&adc1_freq_meter, adc1_value, now);
-  uint32_t adc2_freq = AdcFreq_Update(&adc2_freq_meter, adc2_value, now);
-
-  /* RUN 测量按固定周期收集滤波后的数据，满 4 秒后计算中位数。 */
-  Measurement_Update(now, pa1_freq, adc1_value, adc2_value);
-
-  if ((now - last_touch_tick) >= 20U)
-  {
-    last_touch_tick = now;
-    (void)Touch_Scan(&touch_state);
-    Ui_HandleTouch(&touch_state);
-  }
+  adc1_frequency_hz = AdcFreq_Update(&adc1_freq_meter, adc1_value, now);
+  adc2_frequency_hz = AdcFreq_Update(&adc2_freq_meter, adc2_value, now);
 
   /* DAC 输出跟随 ADC：ADC1 -> DAC1(PA4)，ADC2 -> DAC2(PA5) */
   UpdateDacOutputs(adc1_value, adc2_value);
+}
 
-  /* LCD 只在页面状态改变时重画，避免数值区域持续刷新产生频闪。 */
-  Ui_Update(now, adc1_value, adc2_value, pa1_freq);
+void App_MeasurementTaskStep(void)
+{
+  uint32_t now = HAL_GetTick();
 
-  if ((now - last_vofa_tick) >= VOFA_SEND_PERIOD_MS)
+  if (cable_scan_pending != 0U)
   {
-    last_vofa_tick = now;
-    Vofa_SendSamples(adc1_value, adc2_value, pa1_freq, adc1_freq, adc2_freq);
+    cable_scan_pending = 0U;
+    CableTestManager_Start(&cable_test_manager, now);
   }
+
+  if (cable_test_manager.running != 0U)
+  {
+    (void)CableTestManager_Process(&cable_test_manager, now, &cable_test_result);
+  }
+
+  /* RUN 测量按固定周期收集滤波后的数据，满 4 秒后计算中位数。 */
+  Measurement_Update(now, frequency_hz, adc1_value, adc2_value);
+}
+
+void App_UiTaskStep(void)
+{
+  uint32_t now = HAL_GetTick();
+
+  (void)Touch_Scan(&touch_state);
+  Ui_HandleTouch(&touch_state);
+
+  /* LCD 只由界面任务操作，避免多个任务同时访问 FSMC 和触摸驱动。 */
+  Ui_Update(now, adc1_value, adc2_value, frequency_hz);
+}
+
+void App_VofaTaskStep(void)
+{
+  Vofa_SendSamples(adc1_value,
+                   adc2_value,
+                   frequency_hz,
+                   adc1_frequency_hz,
+                   adc2_frequency_hz);
+}
+
+void App_StorageTaskStep(void)
+{
+  uint8_t success_status;
+
+  if (storage_save_pending == 0U)
+  {
+    return;
+  }
+
+  storage_save_busy = 1U;
+  storage_save_pending = 0U;
+  success_status = storage_save_success_status;
+  calibration_status = (Calibration_SaveNow() != 0U) ? success_status :
+                       ((spi_flash_ready == 0U) ? 5U : 3U);
+  storage_save_busy = 0U;
+  page_dirty = 1U;
 }
 
 static void AdcDacVofa_Start(void)
@@ -618,30 +655,25 @@ static void Vofa_SendSamples(uint16_t value1, uint16_t value2, uint32_t pa1_freq
 static void Measurement_Start(uint32_t now)
 {
   measurement_page = current_page;
-  measurement_start_tick = now;
-  measurement_last_sample_tick = now - RUN_SAMPLE_PERIOD_MS;
-  frequency_sample_count = 0U;
-  difference_sample_count = 0U;
+  RunMeasurement_Start(&run_measurement, (uint8_t)measurement_page, now);
   measurement_results[measurement_page].valid = 0U;
   measurement_results[measurement_page].frequency_valid = 0U;
-  measurement_results[measurement_page].cable_valid = 0U;
-  measurement_results[measurement_page].cable_shielded = 0U;
-  measurement_results[measurement_page].cable_output_mask = 0U;
-  measurement_results[measurement_page].cable_out1_mask = 0U;
-  measurement_results[measurement_page].cable_out2_mask = 0U;
-  measurement_results[measurement_page].cable_wiring = CABLE_WIRING_UNKNOWN;
+  measurement_results[measurement_page].double_end = (DoubleEndMeasurementResult){0};
   measurement_running = 1U;
   page_dirty = 1U;
 
-  /* 线序扫描放在 RUN 开始处，延长GPIO脉冲后仍能在总计4秒内完成测量。 */
+  /* 线序扫描交给独立测量任务，避免阻塞触摸、LCD、ADC和VOFA任务。 */
   if (measurement_page == UI_PAGE_DOUBLE)
   {
-    CableTest_Run(&measurement_results[measurement_page]);
+    cable_test_manager = (CableTestManager){0};
+    cable_test_result = (CableTestResult){0};
+    cable_scan_pending = 1U;
   }
 }
 
 static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1, uint16_t value2)
 {
+  RunMeasurementResult run_result = {0};
   UiMeasurementResult *result;
 
   if (measurement_running == 0U)
@@ -649,38 +681,32 @@ static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1,
     return;
   }
 
-  if ((now - measurement_last_sample_tick) >= RUN_SAMPLE_PERIOD_MS)
-  {
-    measurement_last_sample_tick = now;
-
-    if (difference_sample_count < RUN_MAX_SAMPLES)
-    {
-      difference_samples[difference_sample_count++] = (int32_t)value1 - (int32_t)value2;
-    }
-
-    if ((pa1_freq != 0U) && (frequency_sample_count < RUN_MAX_SAMPLES))
-    {
-      frequency_samples[frequency_sample_count++] = pa1_freq;
-    }
-  }
-
-  if ((now - measurement_start_tick) < RUN_DURATION_MS)
+  if (RunMeasurement_Update(&run_measurement, now, pa1_freq, value1, value2, &run_result) == 0U)
   {
     return;
   }
 
   result = &measurement_results[measurement_page];
-  result->frequency_valid = (frequency_sample_count != 0U) ? 1U : 0U;
-  result->frequency_hz = (frequency_sample_count != 0U) ? MedianU32(frequency_samples, frequency_sample_count) : 0U;
-  result->difference = (difference_sample_count != 0U) ? MedianS32(difference_samples, difference_sample_count) : 0;
+  result->frequency_valid = run_result.frequency_valid;
+  result->frequency_hz = run_result.frequency_hz;
+  result->difference = run_result.difference;
 
   if (measurement_page == UI_PAGE_SINGLE)
   {
     result->valid = result->frequency_valid;
   }
+  else if (measurement_page == UI_PAGE_DOUBLE)
+  {
+    result->valid = run_result.valid;
+    DoubleEndMeasurement_Calculate(result->difference,
+                                   &cable_test_result,
+                                   Calibration_GetDoubleByShield(cable_test_result.shielded),
+                                   Calibration_GetFieldByShield(cable_test_result.shielded),
+                                   &result->double_end);
+  }
   else
   {
-    result->valid = (difference_sample_count != 0U) ? 1U : 0U;
+    result->valid = run_result.valid;
   }
 
   if ((measurement_page == UI_PAGE_CALIBRATION) &&
@@ -691,204 +717,6 @@ static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1,
 
   measurement_running = 0U;
   page_dirty = 1U;
-}
-
-static void CableTest_SetAllOutputsHighImpedance(void)
-{
-  GPIO_InitTypeDef gpio_init = {0};
-
-  /*
-   * 扫描期间未使用的发送脚全部改为高阻输入。
-   * 这样即使网线内部错接或两芯短路，也不会出现一个 GPIO 输出高、另一个输出低的对冲。
-   */
-  gpio_init.Mode = GPIO_MODE_INPUT;
-  gpio_init.Pull = GPIO_NOPULL;
-  gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
-
-  for (uint8_t i = 0U; i < CABLE_OUTPUT_COUNT; ++i)
-  {
-    gpio_init.Pin = cable_output_pins[i];
-    HAL_GPIO_Init(cable_output_ports[i], &gpio_init);
-  }
-}
-
-static void CableTest_EnableOutput(uint8_t index)
-{
-  GPIO_InitTypeDef gpio_init = {0};
-
-  if (index >= CABLE_OUTPUT_COUNT)
-  {
-    return;
-  }
-
-  /* 先把输出锁存器置高，再切换成推挽输出，避免切换瞬间产生低脉冲。 */
-  HAL_GPIO_WritePin(cable_output_ports[index], cable_output_pins[index], GPIO_PIN_SET);
-  gpio_init.Pin = cable_output_pins[index];
-  gpio_init.Mode = GPIO_MODE_OUTPUT_PP;
-  gpio_init.Pull = GPIO_NOPULL;
-  gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
-  HAL_GPIO_Init(cable_output_ports[index], &gpio_init);
-}
-
-static void CableTest_RestoreOutputs(void)
-{
-  GPIO_InitTypeDef gpio_init = {0};
-
-  /* 扫描结束后恢复 IOC 中的默认状态：OUT1、OUT2 推挽输出并保持低电平。 */
-  gpio_init.Mode = GPIO_MODE_OUTPUT_PP;
-  gpio_init.Pull = GPIO_NOPULL;
-  gpio_init.Speed = GPIO_SPEED_FREQ_LOW;
-
-  for (uint8_t i = 0U; i < CABLE_OUTPUT_COUNT; ++i)
-  {
-    HAL_GPIO_WritePin(cable_output_ports[i], cable_output_pins[i], GPIO_PIN_RESET);
-    gpio_init.Pin = cable_output_pins[i];
-    HAL_GPIO_Init(cable_output_ports[i], &gpio_init);
-  }
-}
-
-static void CableTest_Run(UiMeasurementResult *result)
-{
-  uint8_t input_masks[CABLE_OUTPUT_COUNT] = {0U};
-  uint8_t straight = 1U;
-  uint8_t shield_high_count = 0U;
-  uint8_t output_high_mask = 0U;
-
-  if (result == NULL)
-  {
-    return;
-  }
-
-  CableTest_SetAllOutputsHighImpedance();
-
-  for (uint8_t output = 0U; output < CABLE_OUTPUT_COUNT; ++output)
-  {
-    uint8_t high_counts[CABLE_INPUT_COUNT] = {0U};
-
-    CableTest_EnableOutput(output);
-    (void)osDelay(CABLE_SETTLE_MS);
-
-    /* 回读输出引脚实际电平，用于区分GPIO输出故障和网线/输入接线故障。 */
-    if (HAL_GPIO_ReadPin(cable_output_ports[output], cable_output_pins[output]) == GPIO_PIN_SET)
-    {
-      output_high_mask |= (uint8_t)(1U << output);
-    }
-
-    for (uint8_t sample = 0U; sample < CABLE_SAMPLE_COUNT; ++sample)
-    {
-      for (uint8_t input = 0U; input < CABLE_INPUT_COUNT; ++input)
-      {
-        if (HAL_GPIO_ReadPin(cable_input_ports[input], cable_input_pins[input]) == GPIO_PIN_SET)
-        {
-          high_counts[input]++;
-        }
-      }
-      (void)osDelay(CABLE_SAMPLE_INTERVAL_MS);
-    }
-
-    for (uint8_t input = 0U; input < CABLE_INPUT_COUNT; ++input)
-    {
-      if (high_counts[input] > (CABLE_SAMPLE_COUNT / 2U))
-      {
-        input_masks[output] |= (uint8_t)(1U << input);
-      }
-    }
-
-    /* 当前发送脚读完后也恢复高阻，再测试下一芯。 */
-    CableTest_SetAllOutputsHighImpedance();
-    (void)osDelay(1U);
-  }
-
-  /* 外壳接收脚有内部下拉：外部 3.3V 可稳定判为 SFTP，断开则判为 UTP。 */
-  for (uint8_t sample = 0U; sample < CABLE_SAMPLE_COUNT; ++sample)
-  {
-    if (HAL_GPIO_ReadPin(IN_GND_GPIO_Port, IN_GND_Pin) == GPIO_PIN_SET)
-    {
-      shield_high_count++;
-    }
-    (void)osDelay(1U);
-  }
-
-  CableTest_RestoreOutputs();
-
-  /*
-   * 二分类模式只检查直连所需的关键位，忽略接收端可能出现的额外高电平：
-   * OUT1 扫描时 IN1 为高，并且 OUT2 扫描时 IN2 为高，即判定为直连。
-   */
-  if (((input_masks[0] & 0x01U) == 0U) || ((input_masks[1] & 0x02U) == 0U))
-  {
-    straight = 0U;
-  }
-
-  result->cable_valid = 1U;
-  result->cable_shielded = (shield_high_count > (CABLE_SAMPLE_COUNT / 2U)) ? 1U : 0U;
-  result->cable_output_mask = output_high_mask;
-  result->cable_out1_mask = input_masks[0];
-  result->cable_out2_mask = input_masks[1];
-
-  if (straight != 0U)
-  {
-    result->cable_wiring = CABLE_WIRING_STRAIGHT;
-  }
-  else
-  {
-    /* 用户要求采用二分类：只要不是完整直连线，一律显示为交叉线。 */
-    result->cable_wiring = CABLE_WIRING_CROSS;
-  }
-}
-
-static uint32_t MedianU32(uint32_t *values, uint16_t count)
-{
-  for (uint16_t i = 1U; i < count; ++i)
-  {
-    uint32_t key = values[i];
-    uint16_t j = i;
-
-    while ((j > 0U) && (values[j - 1U] > key))
-    {
-      values[j] = values[j - 1U];
-      --j;
-    }
-
-    values[j] = key;
-  }
-
-  if ((count & 1U) != 0U)
-  {
-    return values[count / 2U];
-  }
-
-  return (uint32_t)(((uint64_t)values[(count / 2U) - 1U] + values[count / 2U]) / 2U);
-}
-
-static int32_t MedianS32(int32_t *values, uint16_t count)
-{
-  for (uint16_t i = 1U; i < count; ++i)
-  {
-    int32_t key = values[i];
-    uint16_t j = i;
-
-    while ((j > 0U) && (values[j - 1U] > key))
-    {
-      values[j] = values[j - 1U];
-      --j;
-    }
-
-    values[j] = key;
-  }
-
-  if ((count & 1U) != 0U)
-  {
-    return values[count / 2U];
-  }
-
-  return (int32_t)(((int64_t)values[(count / 2U) - 1U] + values[count / 2U]) / 2);
-}
-
-static float DifferenceToResistance(int32_t difference)
-{
-  uint32_t absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
-  return ((float)absolute_difference * DIFF_VOLTAGE_SCALE) / MEASURE_CURRENT_MA;
 }
 
 static DoubleCalibrationData *Calibration_GetActiveDouble(void)
@@ -910,78 +738,23 @@ static const DoubleCalibrationData *Calibration_GetDoubleByShield(uint8_t shield
   return &double_calibrations[(shielded != 0U) ? 1U : 0U];
 }
 
-static uint8_t Calibration_Fit(DoubleCalibrationData *calibration)
+static DoubleFieldCalibrationData *Calibration_GetActiveField(void)
 {
-  float sum_x = 0.0f;
-  float sum_y = 0.0f;
-  float sum_xx = 0.0f;
-  float sum_xy = 0.0f;
-  float denominator;
-  float count;
-
-  if ((calibration == NULL) || (calibration->point_count < 2U))
+  if (calibration_mode == 1U)
   {
-    return 0U;
+    return &double_field_calibrations[0];
+  }
+  if (calibration_mode == 2U)
+  {
+    return &double_field_calibrations[1];
   }
 
-  count = (float)calibration->point_count;
-
-  for (uint32_t i = 0U; i < calibration->point_count; ++i)
-  {
-    float x = calibration->length_m[i];
-    float y = calibration->resistance_ohm[i];
-    sum_x += x;
-    sum_y += y;
-    sum_xx += x * x;
-    sum_xy += x * y;
-  }
-
-  denominator = count * sum_xx - sum_x * sum_x;
-  if ((denominator > -0.0001f) && (denominator < 0.0001f))
-  {
-    return 0U;
-  }
-
-  calibration->resistance_per_meter = (count * sum_xy - sum_x * sum_y) / denominator;
-  calibration->zero_resistance = (sum_y - calibration->resistance_per_meter * sum_x) / count;
-
-  return (calibration->resistance_per_meter > 0.000001f) ? 1U : 0U;
+  return NULL;
 }
 
-static uint8_t SingleCalibration_Fit(void)
+static const DoubleFieldCalibrationData *Calibration_GetFieldByShield(uint8_t shielded)
 {
-  float sum_x = 0.0f;
-  float sum_y = 0.0f;
-  float sum_xx = 0.0f;
-  float sum_xy = 0.0f;
-  float denominator;
-  float count = (float)single_calibration.point_count;
-
-  if (single_calibration.point_count < 2U)
-  {
-    return 0U;
-  }
-
-  for (uint32_t i = 0U; i < single_calibration.point_count; ++i)
-  {
-    float x = 1000000.0f / (float)single_calibration.frequency_hz[i];
-    float y = single_calibration.length_m[i];
-    sum_x += x;
-    sum_y += y;
-    sum_xx += x * x;
-    sum_xy += x * y;
-  }
-
-  denominator = count * sum_xx - sum_x * sum_x;
-  if ((denominator > -0.0001f) && (denominator < 0.0001f))
-  {
-    return 0U;
-  }
-
-  single_calibration.inverse_period_slope = (count * sum_xy - sum_x * sum_y) / denominator;
-  single_calibration.offset_m = (sum_y - single_calibration.inverse_period_slope * sum_x) / count;
-
-  return (single_calibration.inverse_period_slope > 0.000001f) ? 1U : 0U;
+  return &double_field_calibrations[(shielded != 0U) ? 1U : 0U];
 }
 
 static void Calibration_AutoStart(CalibrationAutoAction action)
@@ -1002,62 +775,44 @@ static void Calibration_AutoStart(CalibrationAutoAction action)
 static void Calibration_AutoComplete(int32_t difference)
 {
   DoubleCalibrationData *calibration = Calibration_GetActiveDouble();
-  uint8_t profile_index;
+  DoubleFieldCalibrationData *field_calibration = Calibration_GetActiveField();
   float measured_resistance;
   float reference_length;
-  float fitted_slope;
 
-  if ((calibration == NULL) || (calibration_mode < 1U) || (calibration_mode > 2U))
+  if ((calibration == NULL) || (field_calibration == NULL) ||
+      (calibration_mode < 1U) || (calibration_mode > 2U))
   {
     calibration_status = 3U;
     calibration_auto_action = CAL_AUTO_NONE;
     return;
   }
 
-  profile_index = (uint8_t)(calibration_mode - 1U);
-  measured_resistance = DifferenceToResistance(difference);
+  measured_resistance = MeasurementMath_DifferenceToResistance(difference,
+                                                               DIFF_VOLTAGE_SCALE,
+                                                               MEASURE_CURRENT_MA);
 
   if (calibration_auto_action == CAL_AUTO_ZERO)
   {
-    /* 短接测量得到现场接插件、测试线和采样电路共同产生的零点电阻。 */
-    calibration->zero_resistance = measured_resistance;
-    calibration_auto_zero_ready[profile_index] = 1U;
-    calibration_status = (Calibration_Save() != 0U) ? 6U :
-                         ((spi_flash_ready == 0U) ? 5U : 3U);
+    /* ZERO只记录现场短接值，不再修改基础拟合的K/B。 */
+    CalibrationModel_SetFieldZero(field_calibration, measured_resistance);
+    Calibration_RequestSave(6U);
   }
   else if (calibration_auto_action == CAL_AUTO_REFERENCE)
   {
     reference_length = (calibration_mode == 1U) ?
                        UTP_REFERENCE_LENGTH_M : SFTP_REFERENCE_LENGTH_M;
 
-    if (calibration_auto_zero_ready[profile_index] != 0U)
-    {
-      /* 已经现场短接校零，可以用一个已知长度参考线重新计算每米电阻。 */
-      fitted_slope = (measured_resistance - calibration->zero_resistance) / reference_length;
-      if (fitted_slope <= 0.000001f)
-      {
-        calibration_status = 3U;
-        calibration_auto_action = CAL_AUTO_NONE;
-        return;
-      }
-      calibration->resistance_per_meter = fitted_slope;
-      calibration_auto_zero_ready[profile_index] = 0U;
-    }
-    else if (calibration->resistance_per_meter > 0.000001f)
-    {
-      /* 没有重新测短接点时保留当前斜率，仅用参考线修正现场零点。 */
-      calibration->zero_resistance = measured_resistance -
-                                     calibration->resistance_per_meter * reference_length;
-    }
-    else
+    if (CalibrationModel_ApplyFieldReference(calibration,
+                                             field_calibration,
+                                             measured_resistance,
+                                             reference_length) == 0U)
     {
       calibration_status = 4U;
       calibration_auto_action = CAL_AUTO_NONE;
       return;
     }
 
-    calibration_status = (Calibration_Save() != 0U) ? 7U :
-                         ((spi_flash_ready == 0U) ? 5U : 3U);
+    Calibration_RequestSave(7U);
   }
 
   calibration_auto_action = CAL_AUTO_NONE;
@@ -1178,7 +933,7 @@ static uint8_t Calibration_AddPoint(void)
     calibration_selected_point = (uint8_t)(single_calibration.point_count - 1U);
     if (single_calibration.point_count >= 2U)
     {
-      (void)SingleCalibration_Fit();
+      (void)CalibrationModel_FitSingle(&single_calibration);
     }
   }
   else
@@ -1196,8 +951,11 @@ static uint8_t Calibration_AddPoint(void)
     calibration_selected_point = (uint8_t)(double_calibration->point_count - 1U);
     if (double_calibration->point_count >= 2U)
     {
-      (void)Calibration_Fit(double_calibration);
+      (void)CalibrationModel_FitDouble(double_calibration);
     }
+
+    /* 基础拟合点发生变化后，原来的现场修正参数已经不再匹配。 */
+    CalibrationModel_ResetField(Calibration_GetActiveField());
   }
 
   calibration_value_input_length = 0U;
@@ -1226,7 +984,7 @@ static void Calibration_DeletePoint(void)
     single_calibration.point_count--;
     if (single_calibration.point_count >= 2U)
     {
-      (void)SingleCalibration_Fit();
+      (void)CalibrationModel_FitSingle(&single_calibration);
     }
   }
   else
@@ -1244,13 +1002,16 @@ static void Calibration_DeletePoint(void)
     double_calibration->point_count--;
     if (double_calibration->point_count >= 2U)
     {
-      (void)Calibration_Fit(double_calibration);
+      (void)CalibrationModel_FitDouble(double_calibration);
     }
     else
     {
       double_calibration->resistance_per_meter = 0.0f;
       double_calibration->zero_resistance = 0.0f;
     }
+
+    /* 删除基础拟合点后，必须重新进行现场参考线校准。 */
+    CalibrationModel_ResetField(Calibration_GetActiveField());
   }
 
   {
@@ -1303,6 +1064,36 @@ static uint32_t Calibration_Checksum(const CalibrationStorage *data)
   return checksum;
 }
 
+static uint32_t Calibration_ChecksumV4(const CalibrationStorageV4 *data)
+{
+  const uint32_t *words = (const uint32_t *)data;
+  uint32_t checksum = 2166136261UL;
+  uint32_t word_count = (sizeof(CalibrationStorageV4) / sizeof(uint32_t)) - 1U;
+
+  for (uint32_t i = 0U; i < word_count; ++i)
+  {
+    checksum ^= words[i];
+    checksum *= 16777619UL;
+  }
+
+  return checksum;
+}
+
+static uint32_t Calibration_ChecksumV3(const CalibrationStorageV3 *data)
+{
+  const uint32_t *words = (const uint32_t *)data;
+  uint32_t checksum = 2166136261UL;
+  uint32_t word_count = (sizeof(CalibrationStorageV3) / sizeof(uint32_t)) - 1U;
+
+  for (uint32_t i = 0U; i < word_count; ++i)
+  {
+    checksum ^= words[i];
+    checksum *= 16777619UL;
+  }
+
+  return checksum;
+}
+
 static uint32_t Calibration_ChecksumV2(const CalibrationStorageV2 *data)
 {
   const uint32_t *words = (const uint32_t *)data;
@@ -1318,7 +1109,64 @@ static uint32_t Calibration_ChecksumV2(const CalibrationStorageV2 *data)
   return checksum;
 }
 
-static uint8_t Calibration_Save(void)
+static void Calibration_ImportLegacySingle(const LegacySingleCalibrationData *source,
+                                           SingleCalibrationData *destination)
+{
+  if ((source == NULL) || (destination == NULL) ||
+      (source->point_count > CALIBRATION_LEGACY_MAX_POINTS))
+  {
+    return;
+  }
+
+  *destination = (SingleCalibrationData){0};
+  destination->point_count = source->point_count;
+  destination->inverse_period_slope = source->inverse_period_slope;
+  destination->offset_m = source->offset_m;
+
+  for (uint32_t i = 0U; i < source->point_count; ++i)
+  {
+    destination->length_m[i] = source->length_m[i];
+    destination->frequency_hz[i] = source->frequency_hz[i];
+  }
+}
+
+static void Calibration_ImportLegacyDouble(const LegacyDoubleCalibrationData *source,
+                                           DoubleCalibrationData *destination)
+{
+  if ((source == NULL) || (destination == NULL) ||
+      (source->point_count > CALIBRATION_LEGACY_MAX_POINTS))
+  {
+    return;
+  }
+
+  *destination = (DoubleCalibrationData){0};
+  destination->point_count = source->point_count;
+  destination->resistance_per_meter = source->resistance_per_meter;
+  destination->zero_resistance = source->zero_resistance;
+
+  for (uint32_t i = 0U; i < source->point_count; ++i)
+  {
+    destination->length_m[i] = source->length_m[i];
+    destination->resistance_ohm[i] = source->resistance_ohm[i];
+  }
+}
+
+static void Calibration_RequestSave(uint8_t success_status)
+{
+  if (spi_flash_ready == 0U)
+  {
+    calibration_status = 5U;
+    page_dirty = 1U;
+    return;
+  }
+
+  storage_save_success_status = success_status;
+  storage_save_pending = 1U;
+  calibration_status = 8U;
+  page_dirty = 1U;
+}
+
+static uint8_t Calibration_SaveNow(void)
 {
   CalibrationStorage storage = {0};
   CalibrationStorage verify = {0};
@@ -1333,6 +1181,8 @@ static uint8_t Calibration_Save(void)
   storage.single = single_calibration;
   storage.utp = double_calibrations[0];
   storage.sftp = double_calibrations[1];
+  storage.utp_field = double_field_calibrations[0];
+  storage.sftp_field = double_field_calibrations[1];
   storage.checksum = Calibration_Checksum(&storage);
 
   if (SpiFlash_WriteSector(CALIBRATION_FLASH_ADDRESS, (const uint8_t *)&storage,
@@ -1347,6 +1197,7 @@ static uint8_t Calibration_Save(void)
   }
 
   return ((verify.magic == CALIBRATION_MAGIC) &&
+          (verify.version == CALIBRATION_VERSION) &&
           (verify.checksum == Calibration_Checksum(&verify))) ? 1U : 0U;
 }
 
@@ -1354,6 +1205,8 @@ static void Calibration_Load(void)
 {
   uint32_t header[2] = {0U, 0U};
   CalibrationStorage stored = {0};
+  CalibrationStorageV4 previous = {0};
+  CalibrationStorageV3 version3 = {0};
   CalibrationStorageV2 legacy = {0};
 
   spi_flash_ready = SpiFlash_Init();
@@ -1380,65 +1233,50 @@ static void Calibration_Load(void)
     single_calibration = stored.single;
     double_calibrations[0] = stored.utp;
     double_calibrations[1] = stored.sftp;
+    double_field_calibrations[0] = stored.utp_field;
+    double_field_calibrations[1] = stored.sftp_field;
+  }
+  else if ((header[1] == CALIBRATION_VERSION_PREVIOUS) &&
+           (SpiFlash_Read(CALIBRATION_FLASH_ADDRESS, (uint8_t *)&previous, (uint16_t)sizeof(previous)) != 0U) &&
+           (previous.single.point_count <= CALIBRATION_LEGACY_MAX_POINTS) &&
+           (previous.utp.point_count <= CALIBRATION_LEGACY_MAX_POINTS) &&
+           (previous.sftp.point_count <= CALIBRATION_LEGACY_MAX_POINTS) &&
+           (previous.checksum == Calibration_ChecksumV4(&previous)))
+  {
+    /* v4的5组数据扩展到当前10组结构，现场校准参数保持不变。 */
+    Calibration_ImportLegacySingle(&previous.single, &single_calibration);
+    Calibration_ImportLegacyDouble(&previous.utp, &double_calibrations[0]);
+    Calibration_ImportLegacyDouble(&previous.sftp, &double_calibrations[1]);
+    double_field_calibrations[0] = previous.utp_field;
+    double_field_calibrations[1] = previous.sftp_field;
+  }
+  else if ((header[1] == CALIBRATION_VERSION_V3) &&
+           (SpiFlash_Read(CALIBRATION_FLASH_ADDRESS, (uint8_t *)&version3, (uint16_t)sizeof(version3)) != 0U) &&
+           (version3.single.point_count <= CALIBRATION_LEGACY_MAX_POINTS) &&
+           (version3.utp.point_count <= CALIBRATION_LEGACY_MAX_POINTS) &&
+           (version3.sftp.point_count <= CALIBRATION_LEGACY_MAX_POINTS) &&
+           (version3.checksum == Calibration_ChecksumV3(&version3)))
+  {
+    /* v3没有独立现场层：保留基础参数，现场校准从未启用状态开始。 */
+    Calibration_ImportLegacySingle(&version3.single, &single_calibration);
+    Calibration_ImportLegacyDouble(&version3.utp, &double_calibrations[0]);
+    Calibration_ImportLegacyDouble(&version3.sftp, &double_calibrations[1]);
+    CalibrationModel_ResetField(&double_field_calibrations[0]);
+    CalibrationModel_ResetField(&double_field_calibrations[1]);
   }
   else if ((header[1] == CALIBRATION_VERSION_LEGACY) &&
            (SpiFlash_Read(CALIBRATION_FLASH_ADDRESS, (uint8_t *)&legacy, (uint16_t)sizeof(legacy)) != 0U) &&
-           (legacy.single.point_count <= CALIBRATION_MAX_POINTS) &&
-           (legacy.double_end.point_count <= CALIBRATION_MAX_POINTS) &&
+           (legacy.single.point_count <= CALIBRATION_LEGACY_MAX_POINTS) &&
+           (legacy.double_end.point_count <= CALIBRATION_LEGACY_MAX_POINTS) &&
            (legacy.checksum == Calibration_ChecksumV2(&legacy)))
   {
     /* 旧版只有一套双端参数，先复制给两种类型，之后可分别重新校准。 */
-    single_calibration = legacy.single;
-    double_calibrations[0] = legacy.double_end;
-    double_calibrations[1] = legacy.double_end;
+    Calibration_ImportLegacySingle(&legacy.single, &single_calibration);
+    Calibration_ImportLegacyDouble(&legacy.double_end, &double_calibrations[0]);
+    Calibration_ImportLegacyDouble(&legacy.double_end, &double_calibrations[1]);
+    CalibrationModel_ResetField(&double_field_calibrations[0]);
+    CalibrationModel_ResetField(&double_field_calibrations[1]);
   }
-}
-
-static uint8_t Calibration_GetLength(float resistance_ohm, uint8_t shielded, float *length_m)
-{
-  const DoubleCalibrationData *calibration = Calibration_GetDoubleByShield(shielded);
-
-  if ((length_m == NULL) || (calibration == NULL) ||
-      (calibration->resistance_per_meter <= 0.000001f))
-  {
-    return 0U;
-  }
-
-  *length_m = (resistance_ohm - calibration->zero_resistance) /
-              calibration->resistance_per_meter;
-
-  if (*length_m < 0.0f)
-  {
-    *length_m = 0.0f;
-  }
-  else if (*length_m > 1000.0f)
-  {
-    *length_m = 1000.0f;
-  }
-
-  return 1U;
-}
-
-static uint8_t SingleCalibration_GetLength(uint32_t frequency_hz, float *length_m)
-{
-  if ((length_m == NULL) || (frequency_hz == 0U) || (single_calibration.point_count < 2U) ||
-      (single_calibration.inverse_period_slope <= 0.000001f))
-  {
-    return 0U;
-  }
-
-  *length_m = single_calibration.inverse_period_slope * (1000000.0f / (float)frequency_hz) +
-              single_calibration.offset_m;
-  if (*length_m < 0.0f)
-  {
-    *length_m = 0.0f;
-  }
-  else if (*length_m > 1000.0f)
-  {
-    *length_m = 1000.0f;
-  }
-
-  return 1U;
 }
 
 static void Ui_Init(void)
@@ -1463,8 +1301,9 @@ static void Ui_Update(uint32_t now, uint16_t value1, uint16_t value2, uint32_t p
     return;
   }
 
-  Ui_DrawPageStatic();
+  /* 先清标志再绘制；其他任务在绘制期间置 1 时，下一轮仍会继续刷新。 */
   page_dirty = 0U;
+  Ui_DrawPageStatic();
 
   if (measurement_running != 0U)
   {
@@ -1676,7 +1515,7 @@ static void Ui_DrawCalibrationPage(void)
 static void Ui_DrawFieldCalibrationPage(void)
 {
   DoubleCalibrationData *calibration;
-  uint8_t profile_index;
+  DoubleFieldCalibrationData *field_calibration;
   uint8_t zero_ready;
   uint8_t zero_running;
   uint8_t reference_running;
@@ -1687,8 +1526,9 @@ static void Ui_DrawFieldCalibrationPage(void)
   }
 
   calibration = Calibration_GetActiveDouble();
-  profile_index = (uint8_t)(calibration_mode - 1U);
-  zero_ready = calibration_auto_zero_ready[profile_index];
+  field_calibration = Calibration_GetActiveField();
+  zero_ready = ((field_calibration != NULL) &&
+                (field_calibration->pending_zero_valid != 0U)) ? 1U : 0U;
   zero_running = ((measurement_running != 0U) &&
                   (calibration_auto_action == CAL_AUTO_ZERO)) ? 1U : 0U;
   reference_running = ((measurement_running != 0U) &&
@@ -1732,7 +1572,10 @@ static void Ui_DrawFieldCalibrationPage(void)
                  (uint8_t *)((calibration != NULL) &&
                              (calibration->resistance_per_meter > 0.000001f) ? "READY" : "EMPTY"));
 
-  LCD_ShowString(48, 134, 56, 16, 16, (uint8_t *)"STATUS:");
+  LCD_DrawRectangle(238, 104, 306, 128);
+  LCD_ShowString(248, 110, 48, 12, 12, (uint8_t *)"RESET");
+
+  LCD_ShowString(48, 134, 48, 16, 16, (uint8_t *)"FIELD:");
   if (calibration_status == 8U)
   {
     LCD_ShowString(154, 134, 56, 16, 16, (uint8_t *)"WAIT...");
@@ -1757,13 +1600,19 @@ static void Ui_DrawFieldCalibrationPage(void)
   {
     LCD_ShowString(154, 134, 40, 16, 16, (uint8_t *)"ERROR");
   }
+  else if (calibration_status == 9U)
+  {
+    LCD_ShowString(154, 134, 64, 16, 16, (uint8_t *)"RESET OK");
+  }
   else if (zero_ready != 0U)
   {
     LCD_ShowString(154, 134, 80, 16, 16, (uint8_t *)"ZERO READY");
   }
   else
   {
-    LCD_ShowString(154, 134, 32, 16, 16, (uint8_t *)"IDLE");
+    LCD_ShowString(154, 134, 24, 16, 16,
+                   (uint8_t *)((field_calibration != NULL) &&
+                               (field_calibration->valid != 0U) ? "ON" : "OFF"));
   }
 
   LCD_Fill(24, 160, 138, 194, zero_running != 0U ? RED : BLUE);
@@ -1842,9 +1691,10 @@ static void Ui_DrawCalibrationValues(void)
   }
   if (point_count != 0U)
   {
-    LCD_ShowNum(28, 82, calibration_selected_point + 1U, 1, 16);
+    /* 现在最多支持10组拟合点，序号和总数都按两位宽度显示。 */
+    LCD_ShowNum(20, 82, calibration_selected_point + 1U, 2, 16);
     LCD_ShowString(40, 82, 8, 16, 16, (uint8_t *)"/");
-    LCD_ShowNum(48, 82, point_count, 1, 16);
+    LCD_ShowNum(48, 82, point_count, 2, 16);
 
     if (calibration_mode == 0U)
     {
@@ -1915,6 +1765,12 @@ static void Ui_HandleCalibrationTouch(uint16_t x, uint16_t y)
     {'7', '8', '9'},
     {'.', '0', '<'}
   };
+
+  /* Flash 保存期间冻结校准数据编辑，避免存储任务读取到一半更新的数据。 */
+  if ((storage_save_pending != 0U) || (storage_save_busy != 0U))
+  {
+    return;
+  }
 
   if (calibration_view != 0U)
   {
@@ -2019,7 +1875,7 @@ static void Ui_HandleCalibrationTouch(uint16_t x, uint16_t y)
     }
     else
     {
-      calibration_status = Calibration_Save() != 0U ? 2U : 3U;
+      Calibration_RequestSave(2U);
     }
     Ui_DrawCalibrationValues();
   }
@@ -2035,11 +1891,10 @@ static void Ui_HandleCalibrationTouch(uint16_t x, uint16_t y)
     }
     else if (double_calibration != NULL)
     {
-      uint8_t profile_index = (uint8_t)(calibration_mode - 1U);
       double_calibration->point_count = 0U;
       double_calibration->resistance_per_meter = 0.0f;
       double_calibration->zero_resistance = 0.0f;
-      calibration_auto_zero_ready[profile_index] = 0U;
+      CalibrationModel_ResetField(Calibration_GetActiveField());
     }
     calibration_selected_point = 0U;
     calibration_value_input_length = 0U;
@@ -2080,6 +1935,12 @@ static void Ui_HandleFieldCalibrationTouch(uint16_t x, uint16_t y)
     calibration_mode = 2U;
     calibration_status = 0U;
     page_dirty = 1U;
+  }
+  else if ((x >= 238U) && (x <= 306U) && (y >= 104U) && (y <= 128U))
+  {
+    /* RESET只清除当前线型的现场修正，基础多点拟合数据保持不变。 */
+    CalibrationModel_ResetField(Calibration_GetActiveField());
+    Calibration_RequestSave(9U);
   }
   else if ((x >= 24U) && (x <= 138U) && (y >= 160U) && (y <= 194U))
   {
@@ -2197,34 +2058,25 @@ static void Ui_DrawSingleValue(uint32_t pa1_freq)
 static uint16_t CalculateLengthX10(uint32_t frequency)
 {
   float calibrated_length_m;
-  uint32_t reciprocal_x1000;
-  uint32_t length_x1000;
 
   if (frequency == 0U)
   {
-    return LENGTH_INVALID_X10;
+    return 0U;
   }
 
-  if (SingleCalibration_GetLength(frequency, &calibrated_length_m) != 0U)
+  if (CalibrationModel_GetSingleLength(&single_calibration,
+                                       frequency,
+                                       &calibrated_length_m) != 0U)
   {
     uint32_t calibrated_x10 = (uint32_t)(calibrated_length_m * 10.0f + 0.5f);
     return (calibrated_x10 > LENGTH_MAX_X10) ? LENGTH_MAX_X10 : (uint16_t)calibrated_x10;
   }
 
-  reciprocal_x1000 = LENGTH_SCALE_X1000 / frequency;
-  if (reciprocal_x1000 <= LENGTH_OFFSET_X1000)
-  {
-    return 0U;
-  }
-
-  length_x1000 = reciprocal_x1000 - LENGTH_OFFSET_X1000;
-  if (length_x1000 >= ((uint32_t)LENGTH_MAX_X10 * 100U))
-  {
-    return LENGTH_MAX_X10;
-  }
-
-  /* 从 0.001m 四舍五入到屏幕显示使用的 0.1m。 */
-  return (uint16_t)((length_x1000 + 50U) / 100U);
+  return MeasurementMath_ReciprocalLengthX10(frequency,
+                                             LENGTH_SCALE_X1000,
+                                             LENGTH_OFFSET_X1000,
+                                             LENGTH_MAX_X10,
+                                             LENGTH_INVALID_X10);
 }
 
 static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10)
@@ -2243,32 +2095,25 @@ static void Ui_DrawLength(uint16_t x, uint16_t y, uint16_t length_x10)
 
 static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
 {
-  int32_t difference;
-  uint32_t absolute_difference;
-  float voltage_mv;
-  float resistance_ohm;
-  float line_length_m = 0.0f;
+  const DoubleEndMeasurementResult *double_result;
   uint32_t voltage_display;
   uint32_t resistance_x100;
   uint32_t length_x10;
 
-  if ((result == NULL) || (result->valid == 0U))
+  if ((result == NULL) || (result->valid == 0U) || (result->double_end.valid == 0U))
   {
     return;
   }
 
-  difference = result->difference;
-  absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
-  voltage_mv = (float)absolute_difference * DIFF_VOLTAGE_SCALE;
-  resistance_ohm = DifferenceToResistance(difference);
-  voltage_display = (uint32_t)(voltage_mv + 0.5f);
-  resistance_x100 = (uint32_t)(resistance_ohm * 100.0f + 0.5f);
+  double_result = &result->double_end;
+  voltage_display = (uint32_t)(double_result->voltage_mv + 0.5f);
+  resistance_x100 = (uint32_t)(double_result->resistance_ohm * 100.0f + 0.5f);
 
   POINT_COLOR = BLACK;
   BACK_COLOR = WHITE;
 
   /* DIFF 保留正负号，表示 ADC1 相对于 ADC2 的极性。 */
-  Ui_DrawSignedValue(118, 46, difference, 16U);
+  Ui_DrawSignedValue(118, 46, double_result->difference, 16U);
 
   /* mV/mA 的数值关系等同于欧姆，因此可直接计算电阻。 */
   LCD_ShowNum(118, 70, voltage_display, 4, 16);
@@ -2279,9 +2124,9 @@ static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
   LCD_ShowxNum(142, 94, resistance_x100 % 100U, 2, 16, 0x80U);
   LCD_ShowString(162, 94, 24, 16, 16, (uint8_t *)"ohm");
 
-  if (Calibration_GetLength(resistance_ohm, result->cable_shielded, &line_length_m) != 0U)
+  if (double_result->length_valid != 0U)
   {
-    length_x10 = (uint32_t)(line_length_m * 10.0f + 0.5f);
+    length_x10 = (uint32_t)(double_result->length_m * 10.0f + 0.5f);
     LCD_ShowNum(118, 118, length_x10 / 10U, 4, 16);
     LCD_ShowString(150, 118, 8, 16, 16, (uint8_t *)".");
     LCD_ShowNum(158, 118, length_x10 % 10U, 1, 16);
@@ -2292,21 +2137,21 @@ static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
     LCD_ShowString(118, 118, 48, 16, 16, (uint8_t *)"--.-m");
   }
 
-  if (result->cable_valid != 0U)
+  if (double_result->cable.valid != 0U)
   {
     LCD_ShowString(118, 146, 32, 16, 16,
-                   (uint8_t *)(result->cable_shielded != 0U ? "SFTP" : "UTP"));
+                   (uint8_t *)(double_result->cable.shielded != 0U ? "SFTP" : "UTP"));
 
-    if (result->cable_wiring == CABLE_WIRING_STRAIGHT)
+    if (double_result->cable.wiring == CABLE_WIRING_STRAIGHT)
     {
       LCD_ShowString(118, 170, 64, 16, 16, (uint8_t *)"STRAIGHT");
     }
-    else if (result->cable_wiring == CABLE_WIRING_CROSS)
+    else if (double_result->cable.wiring == CABLE_WIRING_CROSS)
     {
       LCD_ShowString(118, 170, 40, 16, 16, (uint8_t *)"CROSS");
-      LCD_ShowxNum(162, 170, result->cable_out1_mask, 2, 16, 0x80U);
+      LCD_ShowxNum(162, 170, double_result->cable.out1_input_mask, 2, 16, 0x80U);
       LCD_ShowString(178, 170, 8, 16, 16, (uint8_t *)"/");
-      LCD_ShowxNum(190, 170, result->cable_out2_mask, 2, 16, 0x80U);
+      LCD_ShowxNum(190, 170, double_result->cable.out2_input_mask, 2, 16, 0x80U);
     }
     else
     {
@@ -2315,11 +2160,11 @@ static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
        * IN1=1、IN2=2、IN3=4、IN6=8；直连应为 01/02，交叉应为 04/08。
        */
       LCD_ShowString(118, 170, 8, 16, 16, (uint8_t *)"O");
-      LCD_ShowNum(126, 170, result->cable_output_mask, 1, 16);
+      LCD_ShowNum(126, 170, double_result->cable.output_mask, 1, 16);
       LCD_ShowString(138, 170, 8, 16, 16, (uint8_t *)":");
-      LCD_ShowxNum(150, 170, result->cable_out1_mask, 2, 16, 0x80U);
+      LCD_ShowxNum(150, 170, double_result->cable.out1_input_mask, 2, 16, 0x80U);
       LCD_ShowString(166, 170, 8, 16, 16, (uint8_t *)"/");
-      LCD_ShowxNum(178, 170, result->cable_out2_mask, 2, 16, 0x80U);
+      LCD_ShowxNum(178, 170, double_result->cable.out2_input_mask, 2, 16, 0x80U);
     }
   }
 }

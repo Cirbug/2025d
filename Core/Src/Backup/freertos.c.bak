@@ -45,24 +45,61 @@
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
+static volatile uint8_t appReady = 0U;
 
 /* USER CODE END Variables */
-/* Definitions for ADCDACTask */
-osThreadId_t ADCDACTaskHandle;
-const osThreadAttr_t ADCDACTask_attributes = {
-  .name = "ADCDACTask",
-  .stack_size = 1024 * 4,
+/* Definitions for SamplingTask */
+osThreadId_t SamplingTaskHandle;
+const osThreadAttr_t SamplingTask_attributes = {
+  .name = "SamplingTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityHigh,
+};
+/* Definitions for MeasurementTask */
+osThreadId_t MeasurementTaskHandle;
+const osThreadAttr_t MeasurementTask_attributes = {
+  .name = "MeasurementTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityAboveNormal,
+};
+/* Definitions for UiTask */
+osThreadId_t UiTaskHandle;
+const osThreadAttr_t UiTask_attributes = {
+  .name = "UiTask",
+  .stack_size = 768 * 4,
   .priority = (osPriority_t) osPriorityNormal,
+};
+/* Definitions for VofaTask */
+osThreadId_t VofaTaskHandle;
+const osThreadAttr_t VofaTask_attributes = {
+  .name = "VofaTask",
+  .stack_size = 384 * 4,
+  .priority = (osPriority_t) osPriorityBelowNormal,
+};
+/* Definitions for StorageTask */
+osThreadId_t StorageTaskHandle;
+const osThreadAttr_t StorageTask_attributes = {
+  .name = "StorageTask",
+  .stack_size = 512 * 4,
+  .priority = (osPriority_t) osPriorityLow,
 };
 
 /* Private function prototypes -----------------------------------------------*/
 /* USER CODE BEGIN FunctionPrototypes */
 extern void App_Init(void);
-extern void App_TaskStep(void);
+extern void App_SamplingTaskStep(void);
+extern void App_MeasurementTaskStep(void);
+extern void App_UiTaskStep(void);
+extern void App_VofaTaskStep(void);
+extern void App_StorageTaskStep(void);
 
 /* USER CODE END FunctionPrototypes */
 
-void StartDefaultTask(void *argument);
+void StartSamplingTask(void *argument);
+void StartMeasurementTask(void *argument);
+void StartUiTask(void *argument);
+void StartVofaTask(void *argument);
+void StartStorageTask(void *argument);
 
 void MX_FREERTOS_Init(void); /* (MISRA C 2004 rule 8.1) */
 
@@ -93,8 +130,20 @@ void MX_FREERTOS_Init(void) {
   /* USER CODE END RTOS_QUEUES */
 
   /* Create the thread(s) */
-  /* creation of ADCDACTask */
-  ADCDACTaskHandle = osThreadNew(StartDefaultTask, NULL, &ADCDACTask_attributes);
+  /* creation of SamplingTask */
+  SamplingTaskHandle = osThreadNew(StartSamplingTask, NULL, &SamplingTask_attributes);
+
+  /* creation of MeasurementTask */
+  MeasurementTaskHandle = osThreadNew(StartMeasurementTask, NULL, &MeasurementTask_attributes);
+
+  /* creation of UiTask */
+  UiTaskHandle = osThreadNew(StartUiTask, NULL, &UiTask_attributes);
+
+  /* creation of VofaTask */
+  VofaTaskHandle = osThreadNew(StartVofaTask, NULL, &VofaTask_attributes);
+
+  /* creation of StorageTask */
+  StorageTaskHandle = osThreadNew(StartStorageTask, NULL, &StorageTask_attributes);
 
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
@@ -106,27 +155,123 @@ void MX_FREERTOS_Init(void) {
 
 }
 
-/* USER CODE BEGIN Header_StartDefaultTask */
+/* USER CODE BEGIN Header_StartSamplingTask */
 /**
   * @brief  Function implementing the defaultTask thread.
   * @param  argument: Not used
   * @retval None
   */
-/* USER CODE END Header_StartDefaultTask */
-void StartDefaultTask(void *argument)
+/* USER CODE END Header_StartSamplingTask */
+void StartSamplingTask(void *argument)
 {
-  /* USER CODE BEGIN StartDefaultTask */
-  /* 主任务负责本项目的核心流程：初始化外设、采 ADC、更新 DAC、刷新 LCD、发送 VOFA */
+  /* USER CODE BEGIN StartSamplingTask */
+  /* 只在最高优先级采样任务中执行一次应用初始化，其他任务等待 appReady。 */
   App_Init();
+  appReady = 1U;
 
   /* Infinite loop */
   for(;;)
   {
-    App_TaskStep();
-    /* 1ms 调一次 App_TaskStep，ADC 软件测频的时间分辨率也主要受这个延时影响 */
+    App_SamplingTaskStep();
     osDelay(1);
   }
-  /* USER CODE END StartDefaultTask */
+  /* USER CODE END StartSamplingTask */
+}
+
+/* USER CODE BEGIN Header_StartMeasurementTask */
+/**
+* @brief Function implementing the myTask02 thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartMeasurementTask */
+void StartMeasurementTask(void *argument)
+{
+  /* USER CODE BEGIN StartMeasurementTask */
+  while (appReady == 0U)
+  {
+    osDelay(1);
+  }
+
+  /* Infinite loop */
+  for(;;)
+  {
+    App_MeasurementTaskStep();
+    osDelay(1);
+  }
+  /* USER CODE END StartMeasurementTask */
+}
+
+/* USER CODE BEGIN Header_StartUiTask */
+/**
+* @brief Function implementing the myTask03 thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartUiTask */
+void StartUiTask(void *argument)
+{
+  /* USER CODE BEGIN StartUiTask */
+  while (appReady == 0U)
+  {
+    osDelay(1);
+  }
+
+  /* Infinite loop */
+  for(;;)
+  {
+    App_UiTaskStep();
+    osDelay(20);
+  }
+  /* USER CODE END StartUiTask */
+}
+
+/* USER CODE BEGIN Header_StartVofaTask */
+/**
+* @brief Function implementing the myTask04 thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartVofaTask */
+void StartVofaTask(void *argument)
+{
+  /* USER CODE BEGIN StartVofaTask */
+  while (appReady == 0U)
+  {
+    osDelay(1);
+  }
+
+  /* Infinite loop */
+  for(;;)
+  {
+    App_VofaTaskStep();
+    osDelay(2);
+  }
+  /* USER CODE END StartVofaTask */
+}
+
+/* USER CODE BEGIN Header_StartStorageTask */
+/**
+* @brief Function implementing the myTask05 thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_StartStorageTask */
+void StartStorageTask(void *argument)
+{
+  /* USER CODE BEGIN StartStorageTask */
+  while (appReady == 0U)
+  {
+    osDelay(1);
+  }
+
+  /* Infinite loop */
+  for(;;)
+  {
+    App_StorageTaskStep();
+    osDelay(10);
+  }
+  /* USER CODE END StartStorageTask */
 }
 
 /* Private application code --------------------------------------------------*/

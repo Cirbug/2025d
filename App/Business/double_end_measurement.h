@@ -19,6 +19,7 @@ typedef struct
 void DoubleEndMeasurement_Calculate(int32_t difference,
                                     const CableTestResult *cable,
                                     const DoubleCalibrationData *calibration,
+                                    const DoubleFieldCalibrationData *field_calibration,
                                     DoubleEndMeasurementResult *result);
 
 #endif /* DOUBLE_END_MEASUREMENT_H */

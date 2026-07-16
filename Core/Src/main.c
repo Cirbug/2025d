@@ -39,6 +39,7 @@
 #include "calibration_model.h"
 #include "double_end_measurement.h"
 #include "measurement_math.h"
+#include "ad9954.h"
 #include <stdio.h>
 
 /* USER CODE END Includes */
@@ -428,6 +429,13 @@ void App_Init(void)
   scalar_kalman_init(&adc2_kalman, 1.0f, 1.0f, ADC_KALMAN_Q, ADC_KALMAN_R);
   scalar_kalman_init(&pa1_freq_kalman, 1.0f, 1.0f, PA1_KALMAN_Q, PA1_KALMAN_R);
   Calibration_Load();
+
+  /* AD9954使用20MHz参考时钟和20倍频，ASF=6553对应模块约200mV峰峰值。 */
+  if ((Ad9954_Init() == 0U) ||
+      (Ad9954_SetOutput(30000000UL, AD9954_MAX_AMPLITUDE_SCALE) == 0U))
+  {
+    Error_Handler();
+  }
 
   Ui_Init();
   Touch_Init();

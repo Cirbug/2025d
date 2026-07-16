@@ -56,6 +56,7 @@ target_sources(${CMAKE_PROJECT_NAME} PRIVATE
     HARDWARE/TOUCH/touch.c
     HARDWARE/SPI_FLASH/spi_flash.c
     HARDWARE/CABLE/cable_gpio.c
+    HARDWARE/AD9954/ad9954.c
 )
 
 # Add include paths
@@ -66,6 +67,7 @@ target_include_directories(${CMAKE_PROJECT_NAME} PRIVATE
     HARDWARE/TOUCH
     HARDWARE/SPI_FLASH
     HARDWARE/CABLE
+    HARDWARE/AD9954
 )
 
 # Add project symbols (macros)

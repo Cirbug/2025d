@@ -1,5 +1,28 @@
 #include "median_filter.h"
 
+uint16_t MedianFilter_U16(uint16_t *values, uint16_t count)
+{
+  for (uint16_t i = 1U; i < count; ++i)
+  {
+    uint16_t key = values[i];
+    uint16_t j = i;
+
+    while ((j > 0U) && (values[j - 1U] > key))
+    {
+      values[j] = values[j - 1U];
+      --j;
+    }
+    values[j] = key;
+  }
+
+  if ((count & 1U) != 0U)
+  {
+    return values[count / 2U];
+  }
+
+  return (uint16_t)(((uint32_t)values[(count / 2U) - 1U] + values[count / 2U]) / 2U);
+}
+
 uint32_t MedianFilter_U32(uint32_t *values, uint16_t count)
 {
   for (uint16_t i = 1U; i < count; ++i)

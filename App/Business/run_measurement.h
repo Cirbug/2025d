@@ -11,6 +11,8 @@ typedef struct
   uint8_t frequency_valid;
   uint32_t frequency_hz;
   int32_t difference;
+  uint16_t adc3_input;
+  uint16_t adc3_output;
 } RunMeasurementResult;
 
 typedef struct
@@ -21,8 +23,11 @@ typedef struct
   uint32_t last_sample_tick;
   uint32_t frequency_samples[RUN_MEASUREMENT_MAX_SAMPLES];
   int32_t difference_samples[RUN_MEASUREMENT_MAX_SAMPLES];
+  uint16_t adc3_input_samples[RUN_MEASUREMENT_MAX_SAMPLES];
+  uint16_t adc3_output_samples[RUN_MEASUREMENT_MAX_SAMPLES];
   uint16_t frequency_count;
   uint16_t difference_count;
+  uint16_t adc3_count;
 } RunMeasurement;
 
 void RunMeasurement_Start(RunMeasurement *measurement, uint8_t mode, uint32_t now);
@@ -31,6 +36,8 @@ uint8_t RunMeasurement_Update(RunMeasurement *measurement,
                               uint32_t frequency_hz,
                               uint16_t adc1,
                               uint16_t adc2,
+                              uint16_t adc3_input,
+                              uint16_t adc3_output,
                               RunMeasurementResult *result);
 
 #endif /* RUN_MEASUREMENT_H */

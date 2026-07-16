@@ -54,7 +54,7 @@ void MX_GPIO_Init(void)
   __HAL_RCC_GPIOG_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(TOUCH_CS_GPIO_Port, TOUCH_CS_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOC, TOUCH_CS_Pin|AD9954_CS_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOF, OUT1_Pin|OUT2_Pin|OUT3_Pin|OUT4_Pin
@@ -67,7 +67,19 @@ void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(TOUCH_MOSI_GPIO_Port, TOUCH_MOSI_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOD, OUT7_Pin|OUT8_Pin, GPIO_PIN_RESET);
+  HAL_GPIO_WritePin(GPIOB, AD9954_PWR_Pin|AD9954_RES_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOD, OUT7_Pin|OUT8_Pin|AD9954_SCLK_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOG, AD9954_UPD_Pin|AD9954_SDIO_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, AD9954_PS1_Pin|AD9954_OSK_Pin|AD9954_PS0_Pin, GPIO_PIN_RESET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(AD9954_IOSY_GPIO_Port, AD9954_IOSY_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin : TOUCH_CS_Pin */
   GPIO_InitStruct.Pin = TOUCH_CS_Pin;
@@ -117,6 +129,13 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
   HAL_GPIO_Init(TOUCH_MOSI_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : AD9954_PWR_Pin AD9954_RES_Pin */
+  GPIO_InitStruct.Pin = AD9954_PWR_Pin|AD9954_RES_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOB, &GPIO_InitStruct);
+
   /*Configure GPIO pins : OUT7_Pin OUT8_Pin */
   GPIO_InitStruct.Pin = OUT7_Pin|OUT8_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
@@ -130,11 +149,45 @@ void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(IN_GND_GPIO_Port, &GPIO_InitStruct);
 
+  /*Configure GPIO pins : AD9954_UPD_Pin AD9954_SDIO_Pin */
+  GPIO_InitStruct.Pin = AD9954_UPD_Pin|AD9954_SDIO_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOG, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : AD9954_SDO_Pin */
+  GPIO_InitStruct.Pin = AD9954_SDO_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(AD9954_SDO_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pins : AD9954_CS_Pin AD9954_PS1_Pin AD9954_OSK_Pin AD9954_PS0_Pin */
+  GPIO_InitStruct.Pin = AD9954_CS_Pin|AD9954_PS1_Pin|AD9954_OSK_Pin|AD9954_PS0_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
   /*Configure GPIO pins : IN5_Pin IN7_Pin IN8_Pin */
   GPIO_InitStruct.Pin = IN5_Pin|IN7_Pin|IN8_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_PULLDOWN;
   HAL_GPIO_Init(GPIOC, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : AD9954_IOSY_Pin */
+  GPIO_InitStruct.Pin = AD9954_IOSY_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(AD9954_IOSY_GPIO_Port, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : AD9954_SCLK_Pin */
+  GPIO_InitStruct.Pin = AD9954_SCLK_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull = GPIO_PULLDOWN;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_HIGH;
+  HAL_GPIO_Init(AD9954_SCLK_GPIO_Port, &GPIO_InitStruct);
 
 }
 

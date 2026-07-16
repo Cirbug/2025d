@@ -13,6 +13,10 @@ typedef struct
   float resistance_ohm;
   uint8_t length_valid;
   float length_m;
+  uint16_t adc3_input;
+  uint16_t adc3_output;
+  uint8_t attenuation_valid;
+  float attenuation_db;
   CableTestResult cable;
 } DoubleEndMeasurementResult;
 
@@ -20,6 +24,8 @@ void DoubleEndMeasurement_Calculate(int32_t difference,
                                     const CableTestResult *cable,
                                     const DoubleCalibrationData *calibration,
                                     const DoubleFieldCalibrationData *field_calibration,
+                                    uint16_t adc3_input,
+                                    uint16_t adc3_output,
                                     DoubleEndMeasurementResult *result);
 
 #endif /* DOUBLE_END_MEASUREMENT_H */

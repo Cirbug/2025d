@@ -7,6 +7,10 @@ float MeasurementMath_DifferenceToResistance(int32_t difference,
                                              float voltage_scale_mv,
                                              float current_ma);
 
+uint8_t MeasurementMath_AttenuationDb(float input_level,
+                                      float output_level,
+                                      float *attenuation_db);
+
 uint16_t MeasurementMath_ReciprocalLengthX10(uint32_t frequency_hz,
                                              uint32_t scale_x1000,
                                              uint32_t offset_x1000,

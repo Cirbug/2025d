@@ -81,6 +81,8 @@ void Error_Handler(void);
 #define ADC1_1_GPIO_Port GPIOA
 #define ADC2_2_Pin GPIO_PIN_3
 #define ADC2_2_GPIO_Port GPIOA
+#define IN4_Pin GPIO_PIN_6
+#define IN4_GPIO_Port GPIOA
 #define TOUCH_CLK_Pin GPIO_PIN_0
 #define TOUCH_CLK_GPIO_Port GPIOB
 #define TOUCH_PEN_Pin GPIO_PIN_1
@@ -97,14 +99,12 @@ void Error_Handler(void);
 #define OUT8_GPIO_Port GPIOD
 #define IN_GND_Pin GPIO_PIN_13
 #define IN_GND_GPIO_Port GPIOD
-#define IN4_Pin GPIO_PIN_6
-#define IN4_GPIO_Port GPIOC
 #define IN5_Pin GPIO_PIN_7
 #define IN5_GPIO_Port GPIOC
-#define IN6_Pin GPIO_PIN_8
-#define IN6_GPIO_Port GPIOC
 #define IN7_Pin GPIO_PIN_9
 #define IN7_GPIO_Port GPIOC
+#define IN6_Pin GPIO_PIN_11
+#define IN6_GPIO_Port GPIOA
 #define IN8_Pin GPIO_PIN_10
 #define IN8_GPIO_Port GPIOC
 

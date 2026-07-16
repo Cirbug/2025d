@@ -17,6 +17,7 @@ void RunMeasurement_Start(RunMeasurement *measurement, uint8_t mode, uint32_t no
   measurement->last_sample_tick = now - RUN_SAMPLE_PERIOD_MS;
   measurement->frequency_count = 0U;
   measurement->difference_count = 0U;
+  measurement->adc3_count = 0U;
   measurement->running = 1U;
 }
 
@@ -25,6 +26,8 @@ uint8_t RunMeasurement_Update(RunMeasurement *measurement,
                               uint32_t frequency_hz,
                               uint16_t adc1,
                               uint16_t adc2,
+                              uint16_t adc3_input,
+                              uint16_t adc3_output,
                               RunMeasurementResult *result)
 {
   if ((measurement == NULL) || (result == NULL) || (measurement->running == 0U))
@@ -45,6 +48,13 @@ uint8_t RunMeasurement_Update(RunMeasurement *measurement,
     {
       measurement->frequency_samples[measurement->frequency_count++] = frequency_hz;
     }
+
+    if (measurement->adc3_count < RUN_MEASUREMENT_MAX_SAMPLES)
+    {
+      measurement->adc3_input_samples[measurement->adc3_count] = adc3_input;
+      measurement->adc3_output_samples[measurement->adc3_count] = adc3_output;
+      measurement->adc3_count++;
+    }
   }
 
   if ((now - measurement->start_tick) < RUN_DURATION_MS)
@@ -57,6 +67,10 @@ uint8_t RunMeasurement_Update(RunMeasurement *measurement,
                          MedianFilter_U32(measurement->frequency_samples, measurement->frequency_count) : 0U;
   result->difference = (measurement->difference_count != 0U) ?
                        MedianFilter_S32(measurement->difference_samples, measurement->difference_count) : 0;
+  result->adc3_input = (measurement->adc3_count != 0U) ?
+                       MedianFilter_U16(measurement->adc3_input_samples, measurement->adc3_count) : 0U;
+  result->adc3_output = (measurement->adc3_count != 0U) ?
+                        MedianFilter_U16(measurement->adc3_output_samples, measurement->adc3_count) : 0U;
   result->valid = (measurement->difference_count != 0U) ? 1U : 0U;
   measurement->running = 0U;
   return 1U;

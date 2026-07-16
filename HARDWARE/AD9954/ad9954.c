@@ -107,6 +107,22 @@ uint8_t Ad9954_SetAmplitude(uint16_t amplitude_scale)
   return 1U;
 }
 
+uint8_t Ad9954_SetAmplitudeMv(uint16_t amplitude_mvpp)
+{
+  uint32_t amplitude_scale;
+
+  if (amplitude_mvpp > AD9954_FULL_SCALE_MVPP)
+  {
+    return 0U;
+  }
+
+  /* 按模块满量程约500mVpp进行线性换算，并四舍五入到14位ASF。 */
+  amplitude_scale = ((uint32_t)amplitude_mvpp * AD9954_MAX_AMPLITUDE_SCALE +
+                     (AD9954_FULL_SCALE_MVPP / 2U)) /
+                    AD9954_FULL_SCALE_MVPP;
+  return Ad9954_SetAmplitude((uint16_t)amplitude_scale);
+}
+
 uint8_t Ad9954_SetPhase(uint16_t phase_word)
 {
   uint8_t data[2];
@@ -128,6 +144,18 @@ uint8_t Ad9954_SetOutput(uint32_t frequency_hz, uint16_t amplitude_scale)
   if ((Ad9954_SetPhase(0U) == 0U) ||
       (Ad9954_SetFrequency(frequency_hz) == 0U) ||
       (Ad9954_SetAmplitude(amplitude_scale) == 0U))
+  {
+    return 0U;
+  }
+
+  return 1U;
+}
+
+uint8_t Ad9954_SetOutputMv(uint32_t frequency_hz, uint16_t amplitude_mvpp)
+{
+  if ((Ad9954_SetPhase(0U) == 0U) ||
+      (Ad9954_SetFrequency(frequency_hz) == 0U) ||
+      (Ad9954_SetAmplitudeMv(amplitude_mvpp) == 0U))
   {
     return 0U;
   }

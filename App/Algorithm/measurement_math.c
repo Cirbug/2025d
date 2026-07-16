@@ -1,4 +1,6 @@
 #include "measurement_math.h"
+#include <math.h>
+#include <stddef.h>
 
 float MeasurementMath_DifferenceToResistance(int32_t difference,
                                              float voltage_scale_mv,
@@ -13,6 +15,20 @@ float MeasurementMath_DifferenceToResistance(int32_t difference,
 
   absolute_difference = (difference < 0) ? (uint32_t)(-difference) : (uint32_t)difference;
   return ((float)absolute_difference * voltage_scale_mv) / current_ma;
+}
+
+uint8_t MeasurementMath_AttenuationDb(float input_level,
+                                      float output_level,
+                                      float *attenuation_db)
+{
+  if ((attenuation_db == NULL) || (input_level <= 0.0f) || (output_level <= 0.0f))
+  {
+    return 0U;
+  }
+
+  /* 正值表示信号衰减，负值表示输出端相对输入端存在增益。 */
+  *attenuation_db = 20.0f * log10f(input_level / output_level);
+  return 1U;
 }
 
 uint16_t MeasurementMath_ReciprocalLengthX10(uint32_t frequency_hz,

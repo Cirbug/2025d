@@ -77,6 +77,10 @@ void Error_Handler(void);
 #define IN2_GPIO_Port GPIOF
 #define IN3_Pin GPIO_PIN_8
 #define IN3_GPIO_Port GPIOF
+#define ADC3_IN_Pin GPIO_PIN_0
+#define ADC3_IN_GPIO_Port GPIOC
+#define ADC3_OUT_Pin GPIO_PIN_1
+#define ADC3_OUT_GPIO_Port GPIOC
 #define ADC1_1_Pin GPIO_PIN_2
 #define ADC1_1_GPIO_Port GPIOA
 #define ADC2_2_Pin GPIO_PIN_3
@@ -91,6 +95,8 @@ void Error_Handler(void);
 #define TOUCH_MISO_GPIO_Port GPIOB
 #define TOUCH_MOSI_Pin GPIO_PIN_11
 #define TOUCH_MOSI_GPIO_Port GPIOF
+#define AD9954_PWR_Pin GPIO_PIN_10
+#define AD9954_PWR_GPIO_Port GPIOB
 #define SPI_FLASH_CS_Pin GPIO_PIN_14
 #define SPI_FLASH_CS_GPIO_Port GPIOB
 #define OUT7_Pin GPIO_PIN_11
@@ -99,14 +105,34 @@ void Error_Handler(void);
 #define OUT8_GPIO_Port GPIOD
 #define IN_GND_Pin GPIO_PIN_13
 #define IN_GND_GPIO_Port GPIOD
+#define AD9954_UPD_Pin GPIO_PIN_6
+#define AD9954_UPD_GPIO_Port GPIOG
+#define AD9954_SDO_Pin GPIO_PIN_8
+#define AD9954_SDO_GPIO_Port GPIOG
+#define AD9954_CS_Pin GPIO_PIN_6
+#define AD9954_CS_GPIO_Port GPIOC
 #define IN5_Pin GPIO_PIN_7
 #define IN5_GPIO_Port GPIOC
+#define AD9954_PS1_Pin GPIO_PIN_8
+#define AD9954_PS1_GPIO_Port GPIOC
 #define IN7_Pin GPIO_PIN_9
 #define IN7_GPIO_Port GPIOC
 #define IN6_Pin GPIO_PIN_11
 #define IN6_GPIO_Port GPIOA
+#define AD9954_IOSY_Pin GPIO_PIN_12
+#define AD9954_IOSY_GPIO_Port GPIOA
 #define IN8_Pin GPIO_PIN_10
 #define IN8_GPIO_Port GPIOC
+#define AD9954_OSK_Pin GPIO_PIN_11
+#define AD9954_OSK_GPIO_Port GPIOC
+#define AD9954_PS0_Pin GPIO_PIN_12
+#define AD9954_PS0_GPIO_Port GPIOC
+#define AD9954_SCLK_Pin GPIO_PIN_6
+#define AD9954_SCLK_GPIO_Port GPIOD
+#define AD9954_SDIO_Pin GPIO_PIN_15
+#define AD9954_SDIO_GPIO_Port GPIOG
+#define AD9954_RES_Pin GPIO_PIN_6
+#define AD9954_RES_GPIO_Port GPIOB
 
 /* USER CODE BEGIN Private defines */
 

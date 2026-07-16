@@ -200,6 +200,8 @@ typedef struct
 /* USER CODE BEGIN PV */
 static uint16_t adc1_value = 0U;                         /* ADC1 当前采样值，PA2 */
 static uint16_t adc2_value = 0U;                         /* ADC2 当前采样值，PA3 */
+static uint16_t adc3_input_value = 0U;                   /* ADC3_IN，PC0/ADC3_CH10 */
+static uint16_t adc3_output_value = 0U;                  /* ADC3_OUT，PC1/ADC3_CH11 */
 static volatile uint32_t frequency_hz = 0U;              /* PA1/TIM5 输入捕获测得的频率 */
 static volatile uint32_t frequency_last_capture_tick = 0U; /* PA1 最近一次捕获到边沿的 tick */
 static uint32_t tim5_last_capture = 0U;                  /* TIM5 上一次捕获寄存器值 */
@@ -252,6 +254,7 @@ void MX_FREERTOS_Init(void);
 /* USER CODE BEGIN PFP */
 static void AdcDacVofa_Start(void);
 static uint16_t ReadAdcValue(ADC_HandleTypeDef *hadc, uint16_t previous_value);
+static uint8_t ReadAdc3Pair(uint16_t *input_value, uint16_t *output_value);
 static uint16_t FilterAdcValue(scalar_kalman_t *kalman, uint8_t *ready, uint16_t sample);
 static uint32_t AdcFreq_Update(AdcFreqMeter *meter, uint16_t sample, uint32_t now);
 static void UpdateDacOutputs(uint16_t value1, uint16_t value2);
@@ -351,6 +354,7 @@ int main(void)
   MX_FSMC_Init();
   MX_SPI1_Init();
   MX_TIM5_Init();
+  MX_ADC3_Init();
   /* USER CODE BEGIN 2 */
 
   /* USER CODE END 2 */
@@ -432,7 +436,7 @@ void App_Init(void)
 
   /* AD9954使用20MHz参考时钟和20倍频，ASF=6553对应模块约200mV峰峰值。 */
   if ((Ad9954_Init() == 0U) ||
-      (Ad9954_SetOutput(30000000UL, AD9954_MAX_AMPLITUDE_SCALE) == 0U))
+      Ad9954_SetOutput(30000000UL, AD9954_MAX_AMPLITUDE_SCALE))
   {
     Error_Handler();
   }
@@ -463,6 +467,9 @@ void App_SamplingTaskStep(void)
   uint16_t adc2_sample = ReadAdcValue(&hadc2, adc2_value);
   adc1_value = FilterAdcValue(&adc1_kalman, &adc1_kalman_ready, adc1_sample);
   adc2_value = FilterAdcValue(&adc2_kalman, &adc2_kalman_ready, adc2_sample);
+
+  /* ADC3按规则组顺序读取：CH10为IN，CH11为OUT；RUN阶段再统一取中位数。 */
+  (void)ReadAdc3Pair(&adc3_input_value, &adc3_output_value);
 
   /* 用 ADC 采样值做软件测频。这个方法适合低频，采样间隔越稳定越准 */
   adc1_frequency_hz = AdcFreq_Update(&adc1_freq_meter, adc1_value, now);
@@ -564,6 +571,44 @@ static uint16_t ReadAdcValue(ADC_HandleTypeDef *hadc, uint16_t previous_value)
   (void)HAL_ADC_Stop(hadc);
 
   return value;
+}
+
+static uint8_t ReadAdc3Pair(uint16_t *input_value, uint16_t *output_value)
+{
+  uint16_t input_sample;
+  uint16_t output_sample;
+
+  if ((input_value == NULL) || (output_value == NULL))
+  {
+    return 0U;
+  }
+
+  (void)HAL_ADC_Stop(&hadc3);
+  __HAL_ADC_CLEAR_FLAG(&hadc3, ADC_FLAG_OVR | ADC_FLAG_EOC);
+
+  if (HAL_ADC_Start(&hadc3) != HAL_OK)
+  {
+    return 0U;
+  }
+
+  if (HAL_ADC_PollForConversion(&hadc3, 10U) != HAL_OK)
+  {
+    (void)HAL_ADC_Stop(&hadc3);
+    return 0U;
+  }
+  input_sample = (uint16_t)HAL_ADC_GetValue(&hadc3);
+
+  if (HAL_ADC_PollForConversion(&hadc3, 10U) != HAL_OK)
+  {
+    (void)HAL_ADC_Stop(&hadc3);
+    return 0U;
+  }
+  output_sample = (uint16_t)HAL_ADC_GetValue(&hadc3);
+  (void)HAL_ADC_Stop(&hadc3);
+
+  *input_value = input_sample;
+  *output_value = output_sample;
+  return 1U;
 }
 
 static uint16_t FilterAdcValue(scalar_kalman_t *kalman, uint8_t *ready, uint16_t sample)
@@ -688,7 +733,14 @@ static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1,
     return;
   }
 
-  if (RunMeasurement_Update(&run_measurement, now, pa1_freq, value1, value2, &run_result) == 0U)
+  if (RunMeasurement_Update(&run_measurement,
+                            now,
+                            pa1_freq,
+                            value1,
+                            value2,
+                            adc3_input_value,
+                            adc3_output_value,
+                            &run_result) == 0U)
   {
     return;
   }
@@ -709,6 +761,8 @@ static void Measurement_Update(uint32_t now, uint32_t pa1_freq, uint16_t value1,
                                    &cable_test_result,
                                    Calibration_GetDoubleByShield(cable_test_result.shielded),
                                    Calibration_GetFieldByShield(cable_test_result.shielded),
+                                   run_result.adc3_input,
+                                   run_result.adc3_output,
                                    &result->double_end);
   }
   else
@@ -1414,12 +1468,13 @@ static void Ui_DrawPageStatic(void)
   else if (current_page == UI_PAGE_DOUBLE)
   {
     LCD_ShowString(94, 12, 132, 24, 24, (uint8_t *)"DOUBLE END");
-    LCD_ShowString(38, 46, 48, 16, 16, (uint8_t *)"DIFF:");
-    LCD_ShowString(38, 70, 48, 16, 16, (uint8_t *)"VOLT:");
-    LCD_ShowString(38, 94, 40, 16, 16, (uint8_t *)"RES:");
-    LCD_ShowString(38, 118, 56, 16, 16, (uint8_t *)"LENGTH:");
-    LCD_ShowString(38, 146, 40, 16, 16, (uint8_t *)"TYPE:");
-    LCD_ShowString(38, 170, 40, 16, 16, (uint8_t *)"WIRE:");
+    LCD_ShowString(38, 44, 48, 16, 16, (uint8_t *)"DIFF:");
+    LCD_ShowString(38, 66, 48, 16, 16, (uint8_t *)"VOLT:");
+    LCD_ShowString(38, 88, 40, 16, 16, (uint8_t *)"RES:");
+    LCD_ShowString(38, 110, 56, 16, 16, (uint8_t *)"LENGTH:");
+    LCD_ShowString(38, 132, 48, 16, 16, (uint8_t *)"ATTEN:");
+    LCD_ShowString(38, 154, 40, 16, 16, (uint8_t *)"TYPE:");
+    LCD_ShowString(38, 176, 40, 16, 16, (uint8_t *)"WIRE:");
   }
   else
   {
@@ -2106,6 +2161,8 @@ static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
   uint32_t voltage_display;
   uint32_t resistance_x100;
   uint32_t length_x10;
+  int32_t attenuation_x100;
+  uint32_t attenuation_abs_x100;
 
   if ((result == NULL) || (result->valid == 0U) || (result->double_end.valid == 0U))
   {
@@ -2120,45 +2177,71 @@ static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
   BACK_COLOR = WHITE;
 
   /* DIFF 保留正负号，表示 ADC1 相对于 ADC2 的极性。 */
-  Ui_DrawSignedValue(118, 46, double_result->difference, 16U);
+  Ui_DrawSignedValue(118, 44, double_result->difference, 16U);
 
   /* mV/mA 的数值关系等同于欧姆，因此可直接计算电阻。 */
-  LCD_ShowNum(118, 70, voltage_display, 4, 16);
-  LCD_ShowString(158, 70, 16, 16, 16, (uint8_t *)"mV");
+  LCD_ShowNum(118, 66, voltage_display, 4, 16);
+  LCD_ShowString(158, 66, 16, 16, 16, (uint8_t *)"mV");
 
-  LCD_ShowNum(118, 94, resistance_x100 / 100U, 2, 16);
-  LCD_ShowString(134, 94, 8, 16, 16, (uint8_t *)".");
-  LCD_ShowxNum(142, 94, resistance_x100 % 100U, 2, 16, 0x80U);
-  LCD_ShowString(162, 94, 24, 16, 16, (uint8_t *)"ohm");
+  LCD_ShowNum(118, 88, resistance_x100 / 100U, 2, 16);
+  LCD_ShowString(134, 88, 8, 16, 16, (uint8_t *)".");
+  LCD_ShowxNum(142, 88, resistance_x100 % 100U, 2, 16, 0x80U);
+  LCD_ShowString(162, 88, 24, 16, 16, (uint8_t *)"ohm");
 
   if (double_result->length_valid != 0U)
   {
     length_x10 = (uint32_t)(double_result->length_m * 10.0f + 0.5f);
-    LCD_ShowNum(118, 118, length_x10 / 10U, 4, 16);
-    LCD_ShowString(150, 118, 8, 16, 16, (uint8_t *)".");
-    LCD_ShowNum(158, 118, length_x10 % 10U, 1, 16);
-    LCD_ShowString(170, 118, 8, 16, 16, (uint8_t *)"m");
+    LCD_ShowNum(118, 110, length_x10 / 10U, 4, 16);
+    LCD_ShowString(150, 110, 8, 16, 16, (uint8_t *)".");
+    LCD_ShowNum(158, 110, length_x10 % 10U, 1, 16);
+    LCD_ShowString(170, 110, 8, 16, 16, (uint8_t *)"m");
   }
   else
   {
-    LCD_ShowString(118, 118, 48, 16, 16, (uint8_t *)"--.-m");
+    LCD_ShowString(118, 110, 48, 16, 16, (uint8_t *)"--.-m");
+  }
+
+  if (double_result->attenuation_valid != 0U)
+  {
+    attenuation_x100 = (double_result->attenuation_db >= 0.0f) ?
+                       (int32_t)(double_result->attenuation_db * 100.0f + 0.5f) :
+                       (int32_t)(double_result->attenuation_db * 100.0f - 0.5f);
+    if (attenuation_x100 < 0)
+    {
+      LCD_ShowString(118, 132, 8, 16, 16, (uint8_t *)"-");
+      attenuation_abs_x100 = (uint32_t)(-attenuation_x100);
+    }
+    else
+    {
+      LCD_ShowString(118, 132, 8, 16, 16, (uint8_t *)"+");
+      attenuation_abs_x100 = (uint32_t)attenuation_x100;
+    }
+
+    LCD_ShowNum(130, 132, attenuation_abs_x100 / 100U, 3, 16);
+    LCD_ShowString(154, 132, 8, 16, 16, (uint8_t *)".");
+    LCD_ShowxNum(162, 132, attenuation_abs_x100 % 100U, 2, 16, 0x80U);
+    LCD_ShowString(182, 132, 16, 16, 16, (uint8_t *)"dB");
+  }
+  else
+  {
+    LCD_ShowString(118, 132, 72, 16, 16, (uint8_t *)"--.-- dB");
   }
 
   if (double_result->cable.valid != 0U)
   {
-    LCD_ShowString(118, 146, 32, 16, 16,
+    LCD_ShowString(118, 154, 32, 16, 16,
                    (uint8_t *)(double_result->cable.shielded != 0U ? "SFTP" : "UTP"));
 
     if (double_result->cable.wiring == CABLE_WIRING_STRAIGHT)
     {
-      LCD_ShowString(118, 170, 64, 16, 16, (uint8_t *)"STRAIGHT");
+      LCD_ShowString(118, 176, 64, 16, 16, (uint8_t *)"STRAIGHT");
     }
     else if (double_result->cable.wiring == CABLE_WIRING_CROSS)
     {
-      LCD_ShowString(118, 170, 40, 16, 16, (uint8_t *)"CROSS");
-      LCD_ShowxNum(162, 170, double_result->cable.out1_input_mask, 2, 16, 0x80U);
-      LCD_ShowString(178, 170, 8, 16, 16, (uint8_t *)"/");
-      LCD_ShowxNum(190, 170, double_result->cable.out2_input_mask, 2, 16, 0x80U);
+      LCD_ShowString(118, 176, 40, 16, 16, (uint8_t *)"CROSS");
+      LCD_ShowxNum(162, 176, double_result->cable.out1_input_mask, 2, 16, 0x80U);
+      LCD_ShowString(178, 176, 8, 16, 16, (uint8_t *)"/");
+      LCD_ShowxNum(190, 176, double_result->cable.out2_input_mask, 2, 16, 0x80U);
     }
     else
     {
@@ -2166,12 +2249,12 @@ static void Ui_DrawDoubleValue(const UiMeasurementResult *result)
        * 故障时显示输出回读和 OUT1/OUT2 读到的输入位图，便于排查：
        * IN1=1、IN2=2、IN3=4、IN6=8；直连应为 01/02，交叉应为 04/08。
        */
-      LCD_ShowString(118, 170, 8, 16, 16, (uint8_t *)"O");
-      LCD_ShowNum(126, 170, double_result->cable.output_mask, 1, 16);
-      LCD_ShowString(138, 170, 8, 16, 16, (uint8_t *)":");
-      LCD_ShowxNum(150, 170, double_result->cable.out1_input_mask, 2, 16, 0x80U);
-      LCD_ShowString(166, 170, 8, 16, 16, (uint8_t *)"/");
-      LCD_ShowxNum(178, 170, double_result->cable.out2_input_mask, 2, 16, 0x80U);
+      LCD_ShowString(118, 176, 8, 16, 16, (uint8_t *)"O");
+      LCD_ShowNum(126, 176, double_result->cable.output_mask, 1, 16);
+      LCD_ShowString(138, 176, 8, 16, 16, (uint8_t *)":");
+      LCD_ShowxNum(150, 176, double_result->cable.out1_input_mask, 2, 16, 0x80U);
+      LCD_ShowString(166, 176, 8, 16, 16, (uint8_t *)"/");
+      LCD_ShowxNum(178, 176, double_result->cable.out2_input_mask, 2, 16, 0x80U);
     }
   }
 }
